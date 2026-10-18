@@ -31,4 +31,5 @@ export async function syncPendingSales() {
             if item.product.schedule == 'controlled':
                 add_register_entry(item, batch, q)
 
+<Title> Type Of Drug //<Title>
 
