@@ -21,4 +21,14 @@ export async function syncPendingSales() {
     }
   }
 <body>
+  for item in items:
+        # 1. lock FEFO batches for this product
+        batches = fefo_batches(item.product_id)      # uses fn_fefo_batches()
+        # 2. allocate quantity across batches, earliest expiry first
+        for batch, qty in allocate(batches, item.quantity):
+            create_sale_item_batch(item, batch, qty)
+            create_stock_movement(batch, -qty, 'sale', ref=sale)
+            if item.product.schedule == 'controlled':
+                add_register_entry(item, batch, q)
+
 
