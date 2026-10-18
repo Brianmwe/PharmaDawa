@@ -2,5 +2,23 @@ html
 <Head> "PharmaDawa" //<Head>
 <Title> "Accessible Drugs" //<Title>
 <body>
+export async function syncPendingSales() {
+  const queue = JSON.parse(localStorage.getItem("pending_sales") || "[]");
+  const failed = [];
 
+  for (const sale of queue) {
+    try {
+      const res = await fetch("/api/sales/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sale), // same client_uuid, so retries can't double-post
+      });
+      // 4xx means the server rejected it (e.g. expired batch): keep it for review
+      if (!res.ok && res.status >= 400 && res.status < 500) failed.push(sale);
+      else if (!res.ok) failed.push(sale); // 5xx: try again later
+    } catch {
+      failed.push(sale); // still offline
+    }
+  }
+<body>
 
