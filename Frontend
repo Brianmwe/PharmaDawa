@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PharmaCare - Pharmacy Management System</title>
+  <title>PharmaDawa - Pharmacy Management System</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- Lucide Icons -->
@@ -19,7 +19,7 @@
           <div class="p-2 bg-emerald-500 rounded-lg text-white">
             <i data-lucide="pill" class="w-6 h-6"></i>
           </div>
-          <span class="text-xl font-bold tracking-wide">PharmaCare</span>
+          <span class="text-xl font-bold tracking-wide">PharmaDawa</span>
         </div>
 
         <nav class="space-y-1">
@@ -40,10 +40,10 @@
 
       <div class="border-t border-slate-800 pt-4 flex items-center space-x-3 px-2">
         <div class="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center font-bold text-sm">
-          JD
+          PD
         </div>
         <div>
-          <p class="text-sm font-semibold">Dr. John Doe</p>
+          <p class="text-sm font-semibold">PharmaDawa Staff</p>
           <p class="text-xs text-slate-400">Licensed Pharmacist</p>
         </div>
       </div>
@@ -53,7 +53,10 @@
     <main class="flex-1 flex flex-col overflow-y-auto">
       <!-- Top Navbar -->
       <header class="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
-        <h1 id="page-title" class="text-2xl font-bold text-slate-800">Point of Sale</h1>
+        <div class="flex items-center space-x-3">
+          <h1 id="page-title" class="text-2xl font-bold text-slate-800">Point of Sale</h1>
+          <span class="text-xs bg-emerald-100 text-emerald-800 font-semibold px-2.5 py-0.5 rounded-full border border-emerald-200">PharmaDawa Portal</span>
+        </div>
         <div class="flex items-center space-x-4">
           <span class="text-sm bg-amber-100 text-amber-800 font-medium px-3 py-1 rounded-full border border-amber-200">
             ⚠️ 3 Medicines Expiring Soon
@@ -69,7 +72,7 @@
           <div class="mb-4">
             <div class="relative">
               <i data-lucide="search" class="w-5 h-5 absolute left-3 top-3 text-slate-400"></i>
-              <input type="text" id="search-pos" oninput="filterCatalog()" placeholder="Search medicine by name or generic name..." 
+              <input type="text" id="search-pos" oninput="filterCatalog()" placeholder="Search medicine by name or category in PharmaDawa catalog..." 
                      class="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500">
             </div>
           </div>
@@ -82,7 +85,10 @@
         <!-- Cart / Invoice Sidebar (Right) -->
         <div class="w-96 bg-white border border-slate-200 rounded-xl flex flex-col shadow-sm">
           <div class="p-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-xl">
-            <h2 class="font-bold text-lg text-slate-800">Current Order</h2>
+            <div>
+              <h2 class="font-bold text-lg text-slate-800">Current Sale</h2>
+              <p class="text-xs text-slate-500">PharmaDawa Receipt #PD-1042</p>
+            </div>
             <button onclick="clearCart()" class="text-xs text-red-600 hover:underline">Clear All</button>
           </div>
 
@@ -114,7 +120,7 @@
       <section id="view-inventory" class="flex-1 p-6 hidden">
         <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
           <div class="p-4 border-b border-slate-200 flex justify-between items-center">
-            <h2 class="font-bold text-lg">Stock Management</h2>
+            <h2 class="font-bold text-lg">PharmaDawa Inventory List</h2>
             <button class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition">
               + Add New Medicine
             </button>
@@ -140,7 +146,7 @@
   </div>
 
   <script>
-    // Sample Initial Data
+    // Initial Stock Data
     const medicines = [
       { id: 101, name: "Amoxicillin 500mg", category: "Antibiotic", price: 12.50, stock: 45, expiry: "2026-11-15" },
       { id: 102, name: "Paracetamol 500mg", category: "Analgesic", price: 4.00, stock: 120, expiry: "2027-04-10" },
@@ -283,7 +289,7 @@
 
     function checkout() {
       if (cart.length === 0) return alert("Cart is empty!");
-      alert("Order processed successfully!");
+      alert("PharmaDawa Sale Completed Successfully!");
       clearCart();
     }
   </script>
