@@ -1,52 +1,291 @@
-html 
-<Head> "PharmaDawa" //<Head>
-<Title> "Accessible Drugs" //<Title>
-<body>
-export async function syncPendingSales() {
-  const queue = JSON.parse(localStorage.getItem("pending_sales") || "[]");
-  const failed = [];
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PharmaCare - Pharmacy Management System</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body class="bg-slate-100 text-slate-800 font-sans antialiased">
 
-  for (const sale of queue) {
-    try {
-      const res = await fetch("/api/sales/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sale), // same client_uuid, so retries can't double-post
-      });
-      // 4xx means the server rejected it (e.g. expired batch): keep it for review
-      if (!res.ok && res.status >= 400 && res.status < 500) failed.push(sale);
-      else if (!res.ok) failed.push(sale); // 5xx: try again later
-    } catch {
-      failed.push(sale); // still offline
+  <div class="flex h-screen overflow-hidden">
+    <!-- Sidebar Navigation -->
+    <aside class="w-64 bg-slate-900 text-white flex flex-col justify-between p-4">
+      <div>
+        <div class="flex items-center space-x-3 mb-8 px-2">
+          <div class="p-2 bg-emerald-500 rounded-lg text-white">
+            <i data-lucide="pill" class="w-6 h-6"></i>
+          </div>
+          <span class="text-xl font-bold tracking-wide">PharmaCare</span>
+        </div>
+
+        <nav class="space-y-1">
+          <button onclick="switchTab('pos')" id="nav-pos" class="w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg bg-emerald-600 text-white font-medium transition">
+            <i data-lucide="shopping-cart" class="w-5 h-5"></i>
+            <span>Point of Sale</span>
+          </button>
+          <button onclick="switchTab('inventory')" id="nav-inventory" class="w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white font-medium transition">
+            <i data-lucide="package" class="w-5 h-5"></i>
+            <span>Inventory</span>
+          </button>
+          <button onclick="switchTab('prescriptions')" id="nav-prescriptions" class="w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white font-medium transition">
+            <i data-lucide="file-text" class="w-5 h-5"></i>
+            <span>Prescriptions</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="border-t border-slate-800 pt-4 flex items-center space-x-3 px-2">
+        <div class="w-8 h-8 rounded-full bg-emerald-500 flex items-center justify-center font-bold text-sm">
+          JD
+        </div>
+        <div>
+          <p class="text-sm font-semibold">Dr. John Doe</p>
+          <p class="text-xs text-slate-400">Licensed Pharmacist</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 flex flex-col overflow-y-auto">
+      <!-- Top Navbar -->
+      <header class="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
+        <h1 id="page-title" class="text-2xl font-bold text-slate-800">Point of Sale</h1>
+        <div class="flex items-center space-x-4">
+          <span class="text-sm bg-amber-100 text-amber-800 font-medium px-3 py-1 rounded-full border border-amber-200">
+            ⚠️ 3 Medicines Expiring Soon
+          </span>
+          <span class="text-sm text-slate-500" id="live-clock"></span>
+        </div>
+      </header>
+
+      <!-- View 1: POS Section -->
+      <section id="view-pos" class="flex-1 p-6 flex gap-6">
+        <!-- Medicine Catalog (Left) -->
+        <div class="flex-1 flex flex-col">
+          <div class="mb-4">
+            <div class="relative">
+              <i data-lucide="search" class="w-5 h-5 absolute left-3 top-3 text-slate-400"></i>
+              <input type="text" id="search-pos" oninput="filterCatalog()" placeholder="Search medicine by name or generic name..." 
+                     class="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500">
+            </div>
+          </div>
+
+          <div id="catalog-grid" class="grid grid-cols-3 gap-4 overflow-y-auto pr-1">
+            <!-- Populated dynamically by JS -->
+          </div>
+        </div>
+
+        <!-- Cart / Invoice Sidebar (Right) -->
+        <div class="w-96 bg-white border border-slate-200 rounded-xl flex flex-col shadow-sm">
+          <div class="p-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-xl">
+            <h2 class="font-bold text-lg text-slate-800">Current Order</h2>
+            <button onclick="clearCart()" class="text-xs text-red-600 hover:underline">Clear All</button>
+          </div>
+
+          <div id="cart-items" class="flex-1 p-4 space-y-3 overflow-y-auto">
+            <!-- Cart items populated by JS -->
+          </div>
+
+          <div class="p-4 border-t border-slate-200 bg-slate-50 space-y-2 rounded-b-xl">
+            <div class="flex justify-between text-sm text-slate-600">
+              <span>Subtotal</span>
+              <span id="summary-subtotal">$0.00</span>
+            </div>
+            <div class="flex justify-between text-sm text-slate-600">
+              <span>Tax (5%)</span>
+              <span id="summary-tax">$0.00</span>
+            </div>
+            <div class="flex justify-between font-bold text-lg text-slate-900 border-t border-slate-200 pt-2">
+              <span>Total</span>
+              <span id="summary-total" class="text-emerald-600">$0.00</span>
+            </div>
+            <button onclick="checkout()" class="w-full mt-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 rounded-lg transition">
+              Complete Sale
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- View 2: Inventory Section -->
+      <section id="view-inventory" class="flex-1 p-6 hidden">
+        <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+          <div class="p-4 border-b border-slate-200 flex justify-between items-center">
+            <h2 class="font-bold text-lg">Stock Management</h2>
+            <button class="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition">
+              + Add New Medicine
+            </button>
+          </div>
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr class="bg-slate-50 border-b border-slate-200 text-slate-600 text-xs uppercase font-semibold">
+                <th class="p-4">Medicine Name</th>
+                <th class="p-4">Category</th>
+                <th class="p-4">Stock In Hand</th>
+                <th class="p-4">Price</th>
+                <th class="p-4">Expiry Date</th>
+                <th class="p-4">Status</th>
+              </tr>
+            </thead>
+            <tbody id="inventory-table-body" class="divide-y divide-slate-100 text-sm">
+              <!-- Populated by JS -->
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    // Sample Initial Data
+    const medicines = [
+      { id: 101, name: "Amoxicillin 500mg", category: "Antibiotic", price: 12.50, stock: 45, expiry: "2026-11-15" },
+      { id: 102, name: "Paracetamol 500mg", category: "Analgesic", price: 4.00, stock: 120, expiry: "2027-04-10" },
+      { id: 103, name: "Ibuprofen 400mg", category: "NSAID", price: 8.20, stock: 8, expiry: "2026-05-01" },
+      { id: 104, name: "Omeprazole 20mg", category: "Antacid", price: 15.00, stock: 60, expiry: "2027-01-20" },
+      { id: 105, name: "Cetirizine 10mg", category: "Antihistamine", price: 6.50, stock: 30, expiry: "2026-08-30" },
+      { id: 106, name: "Metformin 850mg", category: "Antidiabetic", price: 18.00, stock: 50, expiry: "2027-09-12" }
+    ];
+
+    let cart = [];
+
+    // Initialize UI
+    document.addEventListener("DOMContentLoaded", () => {
+      lucide.createIcons();
+      renderCatalog(medicines);
+      renderInventory();
+      updateClock();
+      setInterval(updateClock, 1000);
+    });
+
+    // Render POS Catalog
+    function renderCatalog(items) {
+      const grid = document.getElementById("catalog-grid");
+      grid.innerHTML = items.map(med => `
+        <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between hover:border-emerald-500 transition">
+          <div>
+            <span class="text-xs font-semibold uppercase text-slate-400">${med.category}</span>
+            <h3 class="font-bold text-slate-800 text-base mt-1">${med.name}</h3>
+            <p class="text-slate-500 text-xs mt-1">Stock: <span class="${med.stock < 10 ? 'text-red-500 font-bold' : 'text-slate-700'}">${med.stock}</span></p>
+          </div>
+          <div class="mt-4 flex items-center justify-between border-t border-slate-100 pt-3">
+            <span class="font-bold text-slate-900">$${med.price.toFixed(2)}</span>
+            <button onclick="addToCart(${med.id})" class="bg-emerald-50 hover:bg-emerald-600 text-emerald-600 hover:text-white px-3 py-1.5 rounded-lg text-xs font-bold transition">
+              + Add
+            </button>
+          </div>
+        </div>
+      `).join("");
     }
-  }
-<body>
-  for item in items:
-        # 1. lock FEFO batches for this product
-        batches = fefo_batches(item.product_id)      # uses fn_fefo_batches()
-        # 2. allocate quantity across batches, earliest expiry first
-        for batch, qty in allocate(batches, item.quantity):
-            create_sale_item_batch(item, batch, qty)
-            create_stock_movement(batch, -qty, 'sale', ref=sale)
-            if item.product.schedule == 'controlled':
-                add_register_entry(item, batch, q)
 
-<Title> Type Of Drug //<Title>
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-import { VitePWA } from "vite-plugin-pwa";
+    // Cart Logic
+    function addToCart(id) {
+      const med = medicines.find(m => m.id === id);
+      const existing = cart.find(item => item.id === id);
 
-export default defineConfig({
-  plugins: [
-    react(),
-    // Installable app + cached app shell (first step toward offline mode)
-    VitePWA({
-      registerType: "autoUpdate",
-      manifest: {
-        name: "Pharmacy Manager",
-        short_name: "Pharmacy",
-        display: "standalone",
-        background_color: "#f4f7f6",
-        theme_color: "#0b6b5d",
-        icons: [] // add 192x192 and 512x512 PNGs in /public before going live
+      if (existing) {
+        if (existing.qty < med.stock) existing.qty++;
+      } else {
+        cart.push({ ...med, qty: 1 });
+      }
+      renderCart();
+    }
 
+    function updateCartQty(id, delta) {
+      const item = cart.find(i => i.id === id);
+      if (!item) return;
+      item.qty += delta;
+      if (item.qty <= 0) {
+        cart = cart.filter(i => i.id !== id);
+      }
+      renderCart();
+    }
+
+    function clearCart() {
+      cart = [];
+      renderCart();
+    }
+
+    function renderCart() {
+      const container = document.getElementById("cart-items");
+      if (cart.length === 0) {
+        container.innerHTML = `<p class="text-center text-slate-400 text-sm py-8">Cart is empty</p>`;
+        updateTotals(0);
+        return;
+      }
+
+      container.innerHTML = cart.map(item => `
+        <div class="flex items-center justify-between bg-slate-50 p-3 rounded-lg border border-slate-100">
+          <div>
+            <p class="font-bold text-slate-800 text-sm">${item.name}</p>
+            <p class="text-xs text-slate-500">$${item.price.toFixed(2)} each</p>
+          </div>
+          <div class="flex items-center space-x-2">
+            <button onclick="updateCartQty(${item.id}, -1)" class="w-6 h-6 bg-slate-200 rounded flex items-center justify-center text-xs font-bold">-</button>
+            <span class="text-sm font-semibold">${item.qty}</span>
+            <button onclick="updateCartQty(${item.id}, 1)" class="w-6 h-6 bg-slate-200 rounded flex items-center justify-center text-xs font-bold">+</button>
+          </div>
+        </div>
+      `).join("");
+
+      const subtotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0);
+      updateTotals(subtotal);
+    }
+
+    function updateTotals(subtotal) {
+      const tax = subtotal * 0.05;
+      const total = subtotal + tax;
+
+      document.getElementById("summary-subtotal").innerText = `$${subtotal.toFixed(2)}`;
+      document.getElementById("summary-tax").innerText = `$${tax.toFixed(2)}`;
+      document.getElementById("summary-total").innerText = `$${total.toFixed(2)}`;
+    }
+
+    function filterCatalog() {
+      const query = document.getElementById("search-pos").value.toLowerCase();
+      const filtered = medicines.filter(m => m.name.toLowerCase().includes(query) || m.category.toLowerCase().includes(query));
+      renderCatalog(filtered);
+    }
+
+    // Render Inventory
+    function renderInventory() {
+      const tbody = document.getElementById("inventory-table-body");
+      tbody.innerHTML = medicines.map(m => `
+        <tr class="hover:bg-slate-50">
+          <td class="p-4 font-semibold text-slate-800">${m.name}</td>
+          <td class="p-4 text-slate-600">${m.category}</td>
+          <td class="p-4 font-medium">${m.stock}</td>
+          <td class="p-4 text-slate-800">$${m.price.toFixed(2)}</td>
+          <td class="p-4 text-slate-600">${m.expiry}</td>
+          <td class="p-4">
+            <span class="px-2.5 py-1 rounded-full text-xs font-semibold ${m.stock < 10 ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700'}">
+              ${m.stock < 10 ? 'Low Stock' : 'In Stock'}
+            </span>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    // Navigation Switcher
+    function switchTab(tab) {
+      document.getElementById("view-pos").classList.toggle("hidden", tab !== 'pos');
+      document.getElementById("view-inventory").classList.toggle("hidden", tab !== 'inventory');
+      
+      document.getElementById("page-title").innerText = tab === 'pos' ? 'Point of Sale' : 'Inventory Management';
+    }
+
+    function updateClock() {
+      document.getElementById("live-clock").innerText = new Date().toLocaleTimeString();
+    }
+
+    function checkout() {
+      if (cart.length === 0) return alert("Cart is empty!");
+      alert("Order processed successfully!");
+      clearCart();
+    }
+  </script>
+</body>
+</html>
