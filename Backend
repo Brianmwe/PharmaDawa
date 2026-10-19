@@ -1,0 +1,163 @@
+const express = require('express');
+const cors = require('cors');
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Enable Cross-Origin Resource Sharing (CORS) for frontend connection
+app.use(cors());
+app.use(express.json());
+
+// Initialize SQLite database file
+const db = new Database(path.join(__dirname, 'pharmadawa.db'));
+
+// Initialize Database Schema & Initial Data
+function initDatabase() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS medicines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      price REAL NOT NULL,
+      stock INTEGER NOT NULL,
+      expiry TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sales (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      subtotal REAL NOT NULL,
+      tax REAL NOT NULL,
+      total REAL NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sale_id INTEGER NOT NULL,
+      medicine_id INTEGER NOT NULL,
+      quantity INTEGER NOT NULL,
+      price REAL NOT NULL,
+      FOREIGN KEY (sale_id) REFERENCES sales (id),
+      FOREIGN KEY (medicine_id) REFERENCES medicines (id)
+    );
+  `);
+
+  // Seed sample inventory if table is empty
+  const count = db.prepare('SELECT COUNT(*) as count FROM medicines').get();
+  if (count.count === 0) {
+    const insert = db.prepare(
+      'INSERT INTO medicines (name, category, price, stock, expiry) VALUES (?, ?, ?, ?, ?)'
+    );
+    const initialData = [
+      ['Amoxicillin 500mg', 'Antibiotic', 12.50, 45, '2026-11-15'],
+      ['Paracetamol 500mg', 'Analgesic', 4.00, 120, '2027-04-10'],
+      ['Ibuprofen 400mg', 'NSAID', 8.20, 8, '2026-05-01'],
+      ['Omeprazole 20mg', 'Antacid', 15.00, 60, '2027-01-20'],
+      ['Cetirizine 10mg', 'Antihistamine', 6.50, 30, '2026-08-30'],
+      ['Metformin 850mg', 'Antidiabetic', 18.00, 50, '2027-09-12']
+    ];
+    for (const med of initialData) {
+      insert.run(...med);
+    }
+    console.log('PharmaDawa database seeded with default inventory.');
+  }
+}
+
+initDatabase();
+
+// --- REST API ENDPOINTS ---
+
+// 1. GET /api/medicines - Fetch all medicines
+app.get('/api/medicines', (req, res) => {
+  try {
+    const medicines = db.prepare('SELECT * FROM medicines').all();
+    res.json(medicines);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch inventory' });
+  }
+});
+
+// 2. POST /api/medicines - Add a new medicine to inventory
+app.post('/api/medicines', (req, res) => {
+  const { name, category, price, stock, expiry } = req.body;
+  
+  if (!name || !category || price == null || stock == null || !expiry) {
+    return res.status(400).json({ error: 'All fields are required' });
+  }
+
+  try {
+    const stmt = db.prepare(
+      'INSERT INTO medicines (name, category, price, stock, expiry) VALUES (?, ?, ?, ?, ?)'
+    );
+    const result = stmt.run(name, category, price, stock, expiry);
+    res.status(201).json({ id: result.lastInsertRowid, name, category, price, stock, expiry });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to add medicine' });
+  }
+});
+
+// 3. POST /api/sales - Process sale, deduct stock, & create invoice record
+app.post('/api/sales', (req, res) => {
+  const { items } = req.body;
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'Cart items are required' });
+  }
+
+  // Use an atomic transaction for database consistency
+  const processSale = db.transaction((cartItems) => {
+    let subtotal = 0;
+
+    // Verify stock and calculate subtotal
+    for (const item of cartItems) {
+      const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(item.medicineId);
+      if (!med) throw new Error(`Medicine with ID ${item.medicineId} not found`);
+      if (med.stock < item.quantity) {
+        throw new Error(`Insufficient stock for ${med.name}. Available: ${med.stock}`);
+      }
+      subtotal += med.price * item.quantity;
+    }
+
+    const tax = subtotal * 0.05;
+    const total = subtotal + tax;
+
+    // Create sales master record
+    const saleResult = db.prepare(
+      'INSERT INTO sales (subtotal, tax, total) VALUES (?, ?, ?)'
+    ).run(subtotal, tax, total);
+
+    const saleId = saleResult.lastInsertRowid;
+
+    // Insert sale items & deduct inventory stock
+    const insertItem = db.prepare(
+      'INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)'
+    );
+    const updateStock = db.prepare(
+      'UPDATE medicines SET stock = stock - ? WHERE id = ?'
+    );
+
+    for (const item of cartItems) {
+      insertItem.run(saleId, item.medicineId, item.quantity, item.price);
+      updateStock.run(item.quantity, item.medicineId);
+    }
+
+    return { saleId, subtotal, tax, total };
+  });
+
+  try {
+    const saleData = processSale(items);
+    res.status(201).json({
+      message: 'PharmaDawa sale completed successfully!',
+      sale: saleData
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Start Express Server
+app.listen(PORT, () => {
+  console.log(`PharmaDawa API running on http://localhost:${PORT}`);
+});
