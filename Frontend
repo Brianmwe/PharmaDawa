@@ -32,4 +32,21 @@ export async function syncPendingSales() {
                 add_register_entry(item, batch, q)
 
 <Title> Type Of Drug //<Title>
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { VitePWA } from "vite-plugin-pwa";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    // Installable app + cached app shell (first step toward offline mode)
+    VitePWA({
+      registerType: "autoUpdate",
+      manifest: {
+        name: "Pharmacy Manager",
+        short_name: "Pharmacy",
+        display: "standalone",
+        background_color: "#f4f7f6",
+        theme_color: "#0b6b5d",
+        icons: [] // add 192x192 and 512x512 PNGs in /public before going live
 
