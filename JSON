@@ -1,0 +1,10 @@
+[
+  {
+    "id": 101,
+    "name": "Amoxicillin 500mg",
+    "category": "Antibiotic",
+    "price": 12.50,
+    "stock": 45,
+    "expiry": "2026-11-15"
+  }
+]
