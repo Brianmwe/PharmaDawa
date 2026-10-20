@@ -161,3 +161,56 @@ app.post('/api/sales', (req, res) => {
 app.listen(PORT, () => {
   console.log(`PharmaDawa API running on http://localhost:${PORT}`);
 });
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+
+// 1. HELMET: Sets secure HTTP headers (protects against XSS, clickjacking, MIME sniffing)
+app.use(helmet());
+
+// 2. CORS: Restrict access to trusted origins (e.g., your frontend domain)
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5500', // Adjust to match your frontend origin
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// 3. GLOBAL RATE LIMITER: Prevents brute-force and DoS attacks across all routes
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes window
+  max: 100, // Limit each IP to 100 requests per windowMs
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: {
+    status: 429,
+    error: 'Too many requests from this IP, please try again after 15 minutes.'
+  }
+});
+
+app.use('/api', globalLimiter);
+
+// 4. STRICT RATE LIMITER: Extra protection for sensitive endpoints (e.g., Checkout / Sales)
+const checkoutLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute window
+  max: 5, // Limit to 5 sales attempts per minute
+  message: {
+    status: 429,
+    error: 'Too many transactions attempted. Please wait a moment before trying again.'
+  }
+});
+
+app.use(express.json({ limit: '10kb' })); // Restrict payload size to prevent payload flooding
+
+// --- API ROUTES ---
+
+app.get('/api/medicines', (req, res) => {
+  // Fetch medicines logic
+});
+
+// Apply strict rate limiting directly to the checkout route
+app.post('/api/sales', checkoutLimiter, (req, res) => {
+  // Process checkout logic
+});
