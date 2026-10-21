@@ -313,3 +313,17 @@ function requireRole(...allowedRoles) {
     next(); // User has authorized role, proceed to route handler
   };
 }
+// Example: Hide Admin controls based on active session
+function updateUIForUserRole(user) {
+  const adminAddBtn = document.getElementById('btn-add-medicine');
+  const userManagementTab = document.getElementById('nav-user-management');
+
+  if (user.role !== 'admin') {
+    // Hide or disable admin-only features for regular pharmacists
+    if (adminAddBtn) adminAddBtn.style.display = 'none';
+    if (userManagementTab) userManagementTab.style.display = 'none';
+  } else {
+    if (adminAddBtn) adminAddBtn.style.display = 'block';
+    if (userManagementTab) userManagementTab.style.display = 'block';
+  }
+}
