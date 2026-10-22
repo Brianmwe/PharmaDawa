@@ -384,3 +384,36 @@ function initDatabase() {
     );
   `);
 }
+const crypto = require('crypto'); // Built-in Node.js module
+
+// POST /api/auth/change-password (Authenticated User)
+app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const userId = req.user.id;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Both current and new passwords are required.' });
+  }
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+  }
+
+  // 1. Fetch user record
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  // 2. Verify current password
+  const isMatch = bcrypt.compareSync(currentPassword, user.password);
+  if (!isMatch) {
+    return res.status(401).json({ error: 'Incorrect current password.' });
+  }
+
+  // 3. Hash new password & update database
+  const hashedNewPassword = bcrypt.hashSync(newPassword, 10);
+  db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hashedNewPassword, userId);
+
+  res.json({ message: 'Password updated successfully.' });
+});
