@@ -372,3 +372,15 @@ app.post('/api/auth/change-password', authenticateToken, (req, res) => {
 
   res.json({ message: 'Password updated successfully.' });
 });
+function initDatabase() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'pharmacist',
+      reset_token TEXT,
+      reset_token_expires DATETIME
+    );
+  `);
+}
