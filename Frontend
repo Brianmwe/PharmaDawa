@@ -417,3 +417,22 @@ app.post('/api/auth/change-password', authenticateToken, (req, res) => {
 
   res.json({ message: 'Password updated successfully.' });
 });
+// POST /api/admin/reset-user-password (Admin Only)
+app.post('/api/admin/reset-user-password', authenticateToken, requireRole('admin'), (req, res) => {
+  const { targetUsername, newTempPassword } = req.body;
+
+  if (!targetUsername || !newTempPassword) {
+    return res.status(400).json({ error: 'Target username and new temporary password are required.' });
+  }
+
+  const targetUser = db.prepare('SELECT * FROM users WHERE username = ?').get(targetUsername);
+  if (!targetUser) {
+    return res.status(404).json({ error: 'Target user does not exist.' });
+  }
+
+  const hashedTempPassword = bcrypt.hashSync(newTempPassword, 10);
+  db.prepare('UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE id = ?')
+    .run(hashedTempPassword, targetUser.id);
+
+  res.json({ message: `Password for user '${targetUsername}' reset successfully.` });
+});
