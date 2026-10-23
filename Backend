@@ -332,3 +332,45 @@ app.post('/api/medicines', authenticateToken, (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`PharmaDawa API running on port ${PORT}`));
+// PUT /api/medicines/:id - Update an existing medicine's details
+app.put('/api/medicines/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const { name, category, price, stock, expiry } = req.body;
+
+  if (!name || !category || price == null || stock == null || !expiry) {
+    return res.status(400).json({ error: 'All fields are required for update' });
+  }
+
+  try {
+    const stmt = db.prepare(
+      'UPDATE medicines SET name = ?, category = ?, price = ?, stock = ?, expiry = ? WHERE id = ?'
+    );
+    const result = stmt.run(name, category, price, stock, expiry, id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Medicine not found' });
+    }
+
+    res.json({ message: 'Medicine updated successfully', id: Number(id), name, category, price, stock, expiry });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update medicine' });
+  }
+});
+
+// DELETE /api/medicines/:id - Remove a medicine from inventory
+app.delete('/api/medicines/:id', authenticateToken, requireAdmin, (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const stmt = db.prepare('DELETE FROM medicines WHERE id = ?');
+    const result = stmt.run(id);
+
+    if (result.changes === 0) {
+      return res.status(404).json({ error: 'Medicine not found' });
+    }
+
+    res.json({ message: 'Medicine deleted successfully', id: Number(id) });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete medicine' });
+  }
+});
