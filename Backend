@@ -374,3 +374,24 @@ app.delete('/api/medicines/:id', authenticateToken, requireAdmin, (req, res) => 
     res.status(500).json({ error: 'Failed to delete medicine' });
   }
 });
+// GET /api/sales - Fetch all past sales transactions with itemized details
+app.get('/api/sales', authenticateToken, (req, res) => {
+  try {
+    const sales = db.prepare('SELECT * FROM sales ORDER BY created_at DESC').all();
+
+    const detailedSales = sales.map(sale => {
+      const items = db.prepare(`
+        SELECT si.quantity, si.price, m.name as medicine_name 
+        FROM sale_items si 
+        JOIN medicines m ON si.medicine_id = m.id 
+        WHERE si.sale_id = ?
+      `).all(sale.id);
+
+      return { ...sale, items };
+    });
+
+    res.json(detailedSales);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch sales history' });
+  }
+});
