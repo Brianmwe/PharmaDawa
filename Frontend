@@ -485,3 +485,13 @@ app.post('/api/auth/reset-password-with-token', (req, res) => {
 
   res.json({ message: 'Password has been reset successfully. You can now log in.' });
 });
+// GET /api/medicines/low-stock - Fetch medicines with low stock
+app.get('/api/medicines/low-stock', authenticateToken, (req, res) => {
+  try {
+    const threshold = parseInt(req.query.threshold) || 10;
+    const lowStockItems = db.prepare('SELECT * FROM medicines WHERE stock < ?').all(threshold);
+    res.json(lowStockItems);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch low-stock inventory' });
+  }
+});
