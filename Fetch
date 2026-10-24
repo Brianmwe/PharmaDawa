@@ -95,3 +95,53 @@ async function checkout(cartItems) {
     console.error(err);
   }
 }
+const API_BASE_URL = 'http://localhost:3000/api';
+
+// Optional: A global loading indicator toggle
+function setLoading(isLoading) {
+  const spinner = document.getElementById('loading-spinner');
+  if (spinner) {
+    spinner.style.display = isLoading ? 'block' : 'none';
+  }
+}
+
+async function apiRequest(endpoint, options = {}) {
+  const token = localStorage.getItem('pharmadawa_token');
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(token && { 'Authorization': `Bearer ${token}` }),
+    ...options.headers,
+  };
+
+  // Show loading spinner before starting the fetch
+  setLoading(true);
+
+  try {
+    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+      ...options,
+      headers,
+    });
+
+    // Handle expired or unauthorized sessions globally
+    if (res.status === 401 || res.status === 403) {
+      localStorage.removeItem('pharmadawa_token');
+      alert('Session expired. Please log in again.');
+      
+      // Automatically redirect to login page
+      window.location.href = '/login.html'; 
+      throw new Error('Unauthorized');
+    }
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.error || 'Something went wrong');
+    }
+
+    return data;
+  } finally {
+    // Always hide the loading spinner whether the request succeeds or fails
+    setLoading(false);
+  }
+}
