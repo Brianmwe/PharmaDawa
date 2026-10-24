@@ -145,3 +145,28 @@ async function apiRequest(endpoint, options = {}) {
     setLoading(false);
   }
 }
+// 1. Login
+async function login(username, password) {
+  const data = await api('/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password })
+  });
+
+  if (data?.token) {
+    localStorage.setItem('pharmadawa_token', data.token);
+    alert('Welcome back!');
+    window.location.href = '/dashboard.html';
+  }
+}
+
+// 2. Checkout
+async function checkout(cartItems) {
+  const data = await api('/sales', {
+    method: 'POST',
+    body: JSON.stringify({ items: cartItems })
+  });
+
+  if (data) {
+    alert('Order placed successfully!');
+  }
+}
