@@ -65,3 +65,33 @@ async function apiRequest(endpoint, options = {}) {
 
   return data;
 }
+// 1. Login Function (Cleaned up)
+async function login(username, password) {
+  try {
+    const data = await apiRequest('/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password })
+    });
+
+    localStorage.setItem('pharmadawa_token', data.token);
+    alert('Logged in successfully!');
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+// 2. Protected Request / Checkout (Cleaned up)
+async function checkout(cartItems) {
+  try {
+    const data = await apiRequest('/sales', {
+      method: 'POST',
+      body: JSON.stringify({ items: cartItems })
+    });
+
+    alert('Checkout completed successfully!');
+    return data;
+  } catch (err) {
+    // 401/403 are handled globally, other errors are caught here
+    console.error(err);
+  }
+}
