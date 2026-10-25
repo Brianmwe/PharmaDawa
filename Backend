@@ -395,3 +395,23 @@ app.get('/api/sales', authenticateToken, (req, res) => {
     res.status(500).json({ error: 'Failed to fetch sales history' });
   }
 });
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5500',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 100,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many requests, try again later.' }
+});
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  message: { error: 'Too many login attempts.' }
+});
+const checkoutLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 5,
+  message: { error: 'Too many transactions. Wait a moment.' }
+});
+app.use('/api', globalLimiter);
