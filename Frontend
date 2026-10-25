@@ -523,3 +523,26 @@ app.post('/api/users', authenticateToken, requireAdmin, (req, res) => {
     res.status(500).json({ error: 'Failed to create user' });
   }
 });
+function renderMedicines() {
+  const body = document.getElementById('medicine-list');
+  if (!body) return;
+  const isAdmin = getUser()?.role === 'admin';
+  const q = (document.getElementById('search')?.value || '').toLowerCase();
+  const soon = new Date(Date.now() + 60 * 864e5).toISOString().slice(0, 10);
+
+  body.innerHTML = medicines
+    .filter(m => m.name.toLowerCase().includes(q) || m.category.toLowerCase().includes(q))
+    .map(m => `
+      <tr style="${m.stock <= 10 ? 'background:#fff3cd;' : ''}${m.expiry <= soon ? 'color:#b00020;' : ''}">
+        <td>${escapeHtml(m.name)}</td>
+        <td>${escapeHtml(m.category)}</td>
+        <td>${m.price.toFixed(2)}</td>
+        <td>${m.stock}</td>
+        <td>${escapeHtml(m.expiry)}</td>
+        <td>
+          <button onclick="addToCart(${m.id})" ${m.stock < 1 ? 'disabled' : ''}>Add</button>
+          ${isAdmin ? `<button onclick="restock(${m.id})">Restock</button>
+                       <button onclick="deleteMedicine(${m.id})">Delete</button>` : ''}
+        </td>
+      </tr>`).join('');
+}
