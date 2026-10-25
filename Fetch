@@ -170,3 +170,44 @@ async function checkout(cartItems) {
     alert('Order placed successfully!');
   }
 }
+// Restock without resending the whole medicine
+app.patch('/api/medicines/:id/restock', authenticateToken, requireAdmin, (req, res) => {
+  const qty = req.body.quantity;
+  if (!Number.isInteger(qty) || qty <= 0) {
+    return res.status(400).json({ error: 'Quantity must be a positive whole number' });
+  }
+  const r = db.prepare('UPDATE medicines SET stock = stock + ? WHERE id = ?').run(qty, req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Medicine not found' });
+  res.json(db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id));
+});
+
+// Single sale for receipts
+app.get('/api/sales/:id', authenticateToken, (req, res) => {
+  const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
+  if (!sale) return res.status(404).json({ error: 'Sale not found' });
+  sale.items = db.prepare(`
+    SELECT si.quantity, si.price, m.name AS medicine_name
+    FROM sale_items si JOIN medicines m ON si.medicine_id = m.id
+    WHERE si.sale_id = ?`).all(sale.id);
+  res.json(sale);
+});
+
+// Void a sale and put stock back
+const voidSale = db.transaction((id) => {
+  const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
+  if (!sale) throw new Error('Sale not found');
+  if (sale.voided) throw new Error('Sale already voided');
+  const items = db.prepare('SELECT medicine_id, quantity FROM sale_items WHERE sale_id = ?').all(id);
+  const restock = db.prepare('UPDATE medicines SET stock = stock + ? WHERE id = ?');
+  items.forEach(i => restock.run(i.quantity, i.medicine_id));
+  db.prepare('UPDATE sales SET voided = 1 WHERE id = ?').run(id);
+});
+
+app.post('/api/sales/:id/void', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    voidSale(req.params.id);
+    res.json({ message: 'Sale voided and stock restored' });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
