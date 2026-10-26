@@ -546,3 +546,29 @@ function renderMedicines() {
         </td>
       </tr>`).join('');
 }
+async function loadLowStockAlerts() {
+  try {
+    const lowStockItems = await apiRequest('/medicines/low-stock?threshold=10');
+    
+    const alertContainer = document.getElementById('low-stock-alerts');
+    if (!alertContainer) return;
+
+    if (lowStockItems.length === 0) {
+      alertContainer.innerHTML = '<p>All stock levels are healthy.</p>';
+      return;
+    }
+
+    alertContainer.innerHTML = `
+      <h3>⚠️ Low Stock Warnings (${lowStockItems.length})</h3>
+      <ul>
+        ${lowStockItems.map(m => `
+          <li><strong>${m.name}</strong> - Only <span>${m.stock}</span> left! 
+            <button onclick="restockMedicine(${m.id}, 20)">Restock +20</button>
+          </li>
+        `).join('')}
+      </ul>
+    `;
+  } catch (err) {
+    console.error('Failed to load low stock alerts:', err);
+  }
+}
