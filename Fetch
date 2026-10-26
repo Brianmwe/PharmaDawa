@@ -211,3 +211,37 @@ app.post('/api/sales/:id/void', authenticateToken, requireAdmin, (req, res) => {
     res.status(400).json({ error: e.message });
   }
 });
+// Create a new sale and deduct stock (wrapped in a transaction)
+const createSale = db.transaction((items) => {
+  // 1. Insert into sales table
+  const saleInfo = db.prepare('INSERT INTO sales (created_at) VALUES (CURRENT_TIMESTAMP)').run();
+  const saleId = saleInfo.lastInsertRowid;
+
+  const insertItem = db.prepare('INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)');
+  const updateStock = db.prepare('UPDATE medicines SET stock = stock - ? WHERE id = ?');
+  const getMedicine = db.prepare('SELECT stock, price FROM medicines WHERE id = ?');
+
+  for (const item of items) {
+    const med = getMedicine.get(item.medicine_id);
+    if (!med) throw new Error(`Medicine ID ${item.medicine_id} not found`);
+    if (med.stock < item.quantity) throw new Error(`Insufficient stock for medicine ID ${item.medicine_id}`);
+
+    // Update stock and insert sale item
+    updateStock.run(item.quantity, item.medicine_id);
+    insertItem.run(saleId, item.medicine_id, item.quantity, med.price);
+  }
+  return saleId;
+});
+
+app.post('/api/sales', authenticateToken, (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Cart is empty' });
+    }
+    const saleId = createSale(items);
+    res.status(201).json({ message: 'Sale completed', saleId });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
