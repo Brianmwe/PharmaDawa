@@ -415,3 +415,9 @@ const checkoutLimiter = rateLimit({
   message: { error: 'Too many transactions. Wait a moment.' }
 });
 app.use('/api', globalLimiter);
+// Get medicines with stock below a threshold (default: 10)
+app.get('/api/medicines/low-stock', authenticateToken, (req, res) => {
+  const threshold = parseInt(req.query.threshold) || 10;
+  const medicines = db.prepare('SELECT * FROM medicines WHERE stock <= ? ORDER BY stock ASC').all(threshold);
+  res.json(medicines);
+});
