@@ -271,3 +271,16 @@ async function voidSale(saleId) {
     alert(`Void failed: ${err.message}`);
   }
 }
+// Backend: GET /api/medicines?search=paracetamol&page=1&limit=20
+app.get('/api/medicines', authenticateToken, (req, res) => {
+  const { search = '', page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+
+  const medicines = db.prepare(`
+    SELECT * FROM medicines 
+    WHERE name LIKE ? 
+    LIMIT ? OFFSET ?
+  `).all(`%${search}%`, Number(limit), Number(offset));
+
+  res.json(medicines);
+});
