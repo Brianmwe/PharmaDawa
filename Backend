@@ -421,3 +421,8 @@ app.get('/api/medicines/low-stock', authenticateToken, (req, res) => {
   const medicines = db.prepare('SELECT * FROM medicines WHERE stock <= ? ORDER BY stock ASC').all(threshold);
   res.json(medicines);
 });
+const db = new Database(path.join(__dirname, 'pharmadawa.db'));
+
+// Enable WAL mode and set a busy timeout (waits 5 seconds for locks to clear instead of failing instantly)
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
