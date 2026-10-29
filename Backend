@@ -426,3 +426,40 @@ const db = new Database(path.join(__dirname, 'pharmadawa.db'));
 // Enable WAL mode and set a busy timeout (waits 5 seconds for locks to clear instead of failing instantly)
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
+const Joi = require('joi');
+
+// Validation Schemas
+const schemas = {
+  login: Joi.object({
+    username: Joi.string().alphanum().min(3).max(30).required(),
+    password: Joi.string().min(6).required(),
+  }),
+  medicine: Joi.object({
+    name: Joi.string().trim().min(2).max(100).required(),
+    category: Joi.string().trim().required(),
+    price: Joi.number().positive().required(),
+    stock: Joi.number().integer().min(0).required(),
+    expiry: Joi.string().isoDate().required(), // Validates YYYY-MM-DD
+  }),
+  sales: Joi.object({
+    items: Joi.array().items(
+      Joi.object({
+        medicineId: Joi.number().integer().positive().required(),
+        quantity: Joi.number().integer().positive().required(),
+        price: Joi.number().positive().required(),
+      })
+    ).min(1).required(),
+  }),
+};
+
+// Middleware Generator
+const validateBody = (schemaKey) => {
+  return (req, res, next) => {
+    const { error } = schemas[schemaKey].validate(req.body, { abortEarly: false });
+    if (error) {
+      const details = error.details.map(err => err.message);
+      return res.status(400).json({ error: 'Validation failed', details });
+    }
+    next();
+  };
+};
