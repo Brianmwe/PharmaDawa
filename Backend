@@ -487,3 +487,19 @@ app.use((err, req, res, next) => {
       : err.message
   });
 });
+app.get('/api/medicines', authenticateToken, (req, res, next) => {
+  try {
+    const medicines = db.prepare('SELECT * FROM medicines').all();
+    res.json(medicines);
+  } catch (error) {
+    next(error); // Automatically routes to the central handler
+  }
+});
+app.get('/api/medicines', authenticateToken, (req, res, next) => {
+  try {
+    const medicines = db.prepare('SELECT * FROM medicines').all();
+    res.json(medicines);
+  } catch (error) {
+    next(error); // Automatically routes to the central handler
+  }
+});
