@@ -463,3 +463,6 @@ const validateBody = (schemaKey) => {
     next();
   };
 };
+app.post('/api/auth/login', strictLimiter, validateBody('login'), (req, res) => { ... });
+app.post('/api/medicines', authenticateToken, validateBody('medicine'), (req, res) => { ... });
+app.post('/api/sales', authenticateToken, strictLimiter, validateBody('sales'), (req, res) => { ... });
