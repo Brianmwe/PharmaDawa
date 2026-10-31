@@ -503,3 +503,23 @@ app.get('/api/medicines', authenticateToken, (req, res, next) => {
     next(error); // Automatically routes to the central handler
   }
 });
+// Add to initDatabase() schema:
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    details TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// Helper function to record audit events
+function logAudit(userId, action, details) {
+  try {
+    db.prepare('INSERT INTO audit_logs (user_id, action, details) VALUES (?, ?, ?)')
+      .run(userId, action, JSON.stringify(details));
+  } catch (err) {
+    console.error('Failed to write audit log:', err.message);
+  }
+}
