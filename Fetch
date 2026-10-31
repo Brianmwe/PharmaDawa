@@ -284,3 +284,37 @@ app.get('/api/medicines', authenticateToken, (req, res) => {
 
   res.json(medicines);
 });
+const createSale = db.transaction((items) => {
+  let subtotal = 0;
+  const getMedicine = db.prepare('SELECT stock, price FROM medicines WHERE id = ?');
+
+  // 1. First pass: Validate stock and calculate subtotal securely on server
+  for (const item of items) {
+    const med = getMedicine.get(item.medicine_id);
+    if (!med) throw new Error(`Medicine ID ${item.medicine_id} not found`);
+    if (med.stock < item.quantity) throw new Error(`Insufficient stock for medicine ID ${item.medicine_id}`);
+    subtotal += med.price * item.quantity;
+  }
+
+  const tax = subtotal * 0.05; // 5% tax example
+  const total = subtotal + tax;
+
+  // 2. Insert master record with financial totals
+  const saleInfo = db.prepare(
+    'INSERT INTO sales (subtotal, tax, total, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)'
+  ).run(subtotal, tax, total);
+  
+  const saleId = saleInfo.lastInsertRowid;
+
+  const insertItem = db.prepare('INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)');
+  const updateStock = db.prepare('UPDATE medicines SET stock = stock - ? WHERE id = ?');
+
+  // 3. Second pass: Mutate inventory and record items
+  for (const item of items) {
+    const med = getMedicine.get(item.medicine_id);
+    updateStock.run(item.quantity, item.medicine_id);
+    insertItem.run(saleId, item.medicine_id, item.quantity, med.price);
+  }
+
+  return { saleId, subtotal, tax, total };
+});
