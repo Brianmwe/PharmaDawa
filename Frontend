@@ -572,3 +572,40 @@ async function loadLowStockAlerts() {
     console.error('Failed to load low stock alerts:', err);
   }
 }
+// API Moderation & Request Inspection Tool
+function apiModerator(req, res, next) {
+  const startTime = Date.now();
+  const clientIp = req.ip || req.socket.remoteAddress;
+  const userAgent = req.get('user-agent') || 'Unknown';
+  const user = req.user ? req.user.username : 'Anonymous';
+
+  // 1. Basic Malicious Payload / Injection Pattern Detection
+  const suspiciousPatterns = /(\bunion\b.*\bselect\b|<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>)/i;
+  
+  const inspectData = (data) => {
+    if (!data) return false;
+    const stringified = JSON.stringify(data);
+    return suspiciousPatterns.test(stringified);
+  };
+
+  // Check request body, query params, and route parameters
+  if (inspectData(req.body) || inspectData(req.query) || inspectData(req.params)) {
+    console.warn(`[SECURITY ALERT] Potential malicious payload detected from IP: ${clientIp}, User: ${user}, Path: ${req.originalUrl}`);
+    return res.status(403).json({ 
+      error: 'Request blocked by API Moderator: Potentially unsafe payload detected.' 
+    });
+  }
+
+  // 2. Response Tracking & Audit Logging
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+
+    // Log requests that fail or hit sensitive routes
+    if (statusCode >= 400 || req.originalUrl.includes('/api/sales') || req.originalUrl.includes('/api/medicines')) {
+      console.log(`[API MONITOR] ${new Date().toISOString()} | ${req.method} ${req.originalUrl} | Status: ${statusCode} | User: ${user} | IP: ${clientIp} | ${duration}ms`);
+    }
+  });
+
+  next();
+}
