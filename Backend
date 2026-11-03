@@ -631,3 +631,84 @@ app.get('/api/medicines/barcode/:barcode', authenticateToken, (req, res, next) =
     next(error);
   }
 });
+const PDFDocument = require('pdfkit');
+
+// GET /api/sales/:id/receipt - Generate and download a PDF receipt for a specific sale
+app.get('/api/sales/:id/receipt', authenticateToken, (req, res, next) => {
+  try {
+    const saleId = req.params.id;
+
+    // 1. Fetch transaction record
+    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
+    if (!sale) {
+      return res.status(404).json({ error: 'Sales transaction not found.' });
+    }
+
+    // 2. Fetch itemized products for this sale
+    const items = db.prepare(`
+      SELECT si.quantity, si.price, m.name as medicine_name 
+      FROM sale_items si 
+      JOIN medicines m ON si.medicine_id = m.id 
+      WHERE si.sale_id = ?
+    `).all(saleId);
+
+    // 3. Set HTTP headers to stream the PDF file
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=PharmaDawa-Receipt-${saleId}.pdf`);
+
+    // 4. Initialize PDF document stream
+    const doc = new PDFDocument({ margin: 50 });
+    doc.pipe(res);
+
+    // Header styling
+    doc.fontSize(22).fillColor('#2c3e50').text('PharmaDawa Pharmacy', { align: 'center' });
+    doc.fontSize(10).fillColor('#7f8c8d').text('Official Sales & Tax Invoice', { align: 'center' });
+    doc.moveDown(1.5);
+
+    // Transaction Details
+    doc.fontSize(10).fillColor('#333333');
+    doc.text(`Receipt ID: #${sale.id}`, { continued: true });
+    doc.text(`Date: ${sale.created_at}`, { align: 'right' });
+    doc.moveDown();
+
+    // Table Header Separator
+    doc.moveTo(50, doc.y).lineTo(550, doc.y).strokeColor('#bdc3c7').stroke();
+    doc.moveDown(0.5);
+
+    // Table Column Headers
+    doc.font('Helvetica-Bold');
+    doc.text('Item Description', 50, doc.y, { continued: true, width: 220 });
+    doc.text('Qty', 280, doc.y, { continued: true, width: 50 });
+    doc.text('Price', 350, doc.y, { continued: true, width: 80 });
+    doc.text('Total', 450, doc.y);
+    doc.font('Helvetica');
+    doc.moveDown(0.5);
+
+    // Render Line Items
+    items.forEach(item => {
+      const itemTotal = (item.quantity * item.price).toFixed(2);
+      doc.text(item.medicine_name, 50, doc.y, { continued: true, width: 220 });
+      doc.text(item.quantity.toString(), 280, doc.y, { continued: true, width: 50 });
+      doc.text(`$${item.price.toFixed(2)}`, 350, doc.y, { continued: true, width: 80 });
+      doc.text(`$${itemTotal}`, 450, doc.y);
+      doc.moveDown(0.5);
+    });
+
+    doc.moveTo(50, doc.y).lineTo(550, doc.y).strokeColor('#bdc3c7').stroke();
+    doc.moveDown(1);
+
+    // Totals Section (Right aligned)
+    doc.text(`Subtotal: $${sale.subtotal.toFixed(2)}`, { align: 'right' });
+    doc.text(`Tax (5%): $${sale.tax.toFixed(2)}`, { align: 'right' });
+    doc.fontSize(12).font('Helvetica-Bold').text(`Total Amount: $${sale.total.toFixed(2)}`, { align: 'right' });
+    doc.moveDown(2.5);
+
+    // Footer Message
+    doc.fontSize(9).font('Helvetica-Oblique').fillColor('#95a5a6')
+       .text('Thank you for shopping at PharmaDawa. Get well soon!', { align: 'center' });
+
+    doc.end();
+  } catch (error) {
+    next(error);
+  }
+});
