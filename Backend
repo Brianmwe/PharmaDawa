@@ -593,3 +593,41 @@ app.get('/api/medicines/expiring-soon', authenticateToken, (req, res, next) => {
     next(error);
   }
 });
+// GET /api/medicines/barcode/:barcode - Scan/Lookup medicine by barcode during POS checkout
+app.get('/api/medicines/barcode/:barcode', authenticateToken, (req, res, next) => {
+  try {
+    const { barcode } = req.params;
+    
+    const medicine = db.prepare('SELECT * FROM medicines WHERE barcode = ?').get(barcode);
+    
+    if (!medicine) {
+      return res.status(404).json({ error: 'No medicine found matching this barcode.' });
+    }
+    
+    res.json({
+      success: true,
+      medicine
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+// GET /api/medicines/barcode/:barcode - Scan/Lookup medicine by barcode during POS checkout
+app.get('/api/medicines/barcode/:barcode', authenticateToken, (req, res, next) => {
+  try {
+    const { barcode } = req.params;
+    
+    const medicine = db.prepare('SELECT * FROM medicines WHERE barcode = ?').get(barcode);
+    
+    if (!medicine) {
+      return res.status(404).json({ error: 'No medicine found matching this barcode.' });
+    }
+    
+    res.json({
+      success: true,
+      medicine
+    });
+  } catch (error) {
+    next(error);
+  }
+});
