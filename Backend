@@ -523,3 +523,49 @@ function logAudit(userId, action, details) {
     console.error('Failed to write audit log:', err.message);
   }
 }
+// GET /api/dashboard/stats - Aggregate metrics for the PharmaDawa admin dashboard
+app.get('/api/dashboard/stats', authenticateToken, (req, res, next) => {
+  try {
+    // 1. Overall Inventory Statistics & Valuation
+    const inventoryStats = db.prepare(`
+      SELECT 
+        COUNT(*) as totalProducts, 
+        SUM(stock) as totalStockUnits, 
+        ROUND(SUM(price * stock), 2) as totalInventoryValue 
+      FROM medicines
+    `).get();
+
+    // 2. Low Stock Items Count (Threshold <= 10)
+    const lowStockCount = db.prepare(
+      'SELECT COUNT(*) as count FROM medicines WHERE stock <= 10'
+    ).get().count;
+
+    // 3. Today's Sales & Revenue
+    const todaySales = db.prepare(`
+      SELECT 
+        COUNT(*) as transactionsCount, 
+        ROUND(COALESCE(SUM(total), 0), 2) as totalRevenue 
+      FROM sales 
+      WHERE DATE(created_at) = DATE('now', 'localtime')
+    `).get();
+
+    // 4. Products Expiring Soon (Within the next 60 days)
+    const expiringSoonCount = db.prepare(`
+      SELECT COUNT(*) as count 
+      FROM medicines 
+      WHERE expiry BETWEEN DATE('now') AND DATE('now', '+60 days')
+    `).get().count;
+
+    res.json({
+      success: true,
+      data: {
+        inventory: inventoryStats,
+        lowStockCount,
+        todaySales,
+        expiringSoonCount
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
