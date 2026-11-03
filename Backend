@@ -569,3 +569,27 @@ app.get('/api/dashboard/stats', authenticateToken, (req, res, next) => {
     next(error);
   }
 });
+// GET /api/medicines/expiring-soon - Fetch medicines nearing their expiry date
+app.get('/api/medicines/expiring-soon', authenticateToken, (req, res, next) => {
+  try {
+    // Allow custom days via query parameter (e.g., /api/medicines/expiring-soon?days=30)
+    const days = parseInt(req.query.days) || 60;
+
+    const medicines = db.prepare(`
+      SELECT *, 
+             CAST(JULIANDAY(expiry) - JULIANDAY('now') AS INTEGER) as days_left
+      FROM medicines 
+      WHERE expiry BETWEEN DATE('now') AND DATE('now', ? || ' days')
+      ORDER BY expiry ASC
+    `).all(days);
+
+    res.json({
+      success: true,
+      windowDays: days,
+      count: medicines.length,
+      medicines
+    });
+  } catch (error) {
+    next(error);
+  }
+});
