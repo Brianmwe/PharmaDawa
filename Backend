@@ -1,714 +1,122 @@
-const express = require('express');
-const cors = require('cors');
-const Database = require('better-sqlite3');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Enable Cross-Origin Resource Sharing (CORS) for frontend connection
-app.use(cors());
-app.use(express.json());
-
-// Initialize SQLite database file
-const db = new Database(path.join(__dirname, 'pharmadawa.db'));
-
-// Initialize Database Schema & Initial Data
-function initDatabase() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS medicines (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      price REAL NOT NULL,
-      stock INTEGER NOT NULL,
-      expiry TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sales (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      subtotal REAL NOT NULL,
-      tax REAL NOT NULL,
-      total REAL NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS sale_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sale_id INTEGER NOT NULL,
-      medicine_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      price REAL NOT NULL,
-      FOREIGN KEY (sale_id) REFERENCES sales (id),
-      FOREIGN KEY (medicine_id) REFERENCES medicines (id)
-    );
-  `);
-
-  // Seed sample inventory if table is empty
-  const count = db.prepare('SELECT COUNT(*) as count FROM medicines').get();
-  if (count.count === 0) {
-    const insert = db.prepare(
-      'INSERT INTO medicines (name, category, price, stock, expiry) VALUES (?, ?, ?, ?, ?)'
-    );
-    const initialData = [
-      ['Amoxicillin 500mg', 'Antibiotic', 12.50, 45, '2026-11-15'],
-      ['Paracetamol 500mg', 'Analgesic', 4.00, 120, '2027-04-10'],
-      ['Ibuprofen 400mg', 'NSAID', 8.20, 8, '2026-05-01'],
-      ['Omeprazole 20mg', 'Antacid', 15.00, 60, '2027-01-20'],
-      ['Cetirizine 10mg', 'Antihistamine', 6.50, 30, '2026-08-30'],
-      ['Metformin 850mg', 'Antidiabetic', 18.00, 50, '2027-09-12']
-    ];
-    for (const med of initialData) {
-      insert.run(...med);
-    }
-    console.log('PharmaDawa database seeded with default inventory.');
-  }
-}
-
-initDatabase();
-
-// --- REST API ENDPOINTS ---
-
-// 1. GET /api/medicines - Fetch all medicines
-app.get('/api/medicines', (req, res) => {
-  try {
-    const medicines = db.prepare('SELECT * FROM medicines').all();
-    res.json(medicines);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch inventory' });
-  }
-});
-
-// 2. POST /api/medicines - Add a new medicine to inventory
-app.post('/api/medicines', (req, res) => {
-  const { name, category, price, stock, expiry } = req.body;
-  
-  if (!name || !category || price == null || stock == null || !expiry) {
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-
-  try {
-    const stmt = db.prepare(
-      'INSERT INTO medicines (name, category, price, stock, expiry) VALUES (?, ?, ?, ?, ?)'
-    );
-    const result = stmt.run(name, category, price, stock, expiry);
-    res.status(201).json({ id: result.lastInsertRowid, name, category, price, stock, expiry });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to add medicine' });
-  }
-});
-
-// 3. POST /api/sales - Process sale, deduct stock, & create invoice record
-app.post('/api/sales', (req, res) => {
-  const { items } = req.body;
-
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Cart items are required' });
-  }
-
-  // Use an atomic transaction for database consistency
-  const processSale = db.transaction((cartItems) => {
-    let subtotal = 0;
-
-    // Verify stock and calculate subtotal
-    for (const item of cartItems) {
-      const med = db.prepare('SELECT * FROM medicines WHERE id = ?').get(item.medicineId);
-      if (!med) throw new Error(`Medicine with ID ${item.medicineId} not found`);
-      if (med.stock < item.quantity) {
-        throw new Error(`Insufficient stock for ${med.name}. Available: ${med.stock}`);
-      }
-      subtotal += med.price * item.quantity;
-    }
-
-    const tax = subtotal * 0.05;
-    const total = subtotal + tax;
-
-    // Create sales master record
-    const saleResult = db.prepare(
-      'INSERT INTO sales (subtotal, tax, total) VALUES (?, ?, ?)'
-    ).run(subtotal, tax, total);
-
-    const saleId = saleResult.lastInsertRowid;
-
-    // Insert sale items & deduct inventory stock
-    const insertItem = db.prepare(
-      'INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)'
-    );
-    const updateStock = db.prepare(
-      'UPDATE medicines SET stock = stock - ? WHERE id = ?'
-    );
-
-    for (const item of cartItems) {
-      insertItem.run(saleId, item.medicineId, item.quantity, item.price);
-      updateStock.run(item.quantity, item.medicineId);
-    }
-
-    return { saleId, subtotal, tax, total };
-  });
-
-  try {
-    const saleData = processSale(items);
-    res.status(201).json({
-      message: 'PharmaDawa sale completed successfully!',
-      sale: saleData
-    });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// Start Express Server
-app.listen(PORT, () => {
-  console.log(`PharmaDawa API running on http://localhost:${PORT}`);
-});
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-
-const app = express();
-
-// 1. HELMET: Sets secure HTTP headers (protects against XSS, clickjacking, MIME sniffing)
-app.use(helmet());
-
-// 2. CORS: Restrict access to trusted origins (e.g., your frontend domain)
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5500', // Adjust to match your frontend origin
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-// 3. GLOBAL RATE LIMITER: Prevents brute-force and DoS attacks across all routes
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes window
-  max: 100, // Limit each IP to 100 requests per windowMs
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  message: {
-    status: 429,
-    error: 'Too many requests from this IP, please try again after 15 minutes.'
-  }
-});
-
-app.use('/api', globalLimiter);
-
-// 4. STRICT RATE LIMITER: Extra protection for sensitive endpoints (e.g., Checkout / Sales)
-const checkoutLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute window
-  max: 5, // Limit to 5 sales attempts per minute
-  message: {
-    status: 429,
-    error: 'Too many transactions attempted. Please wait a moment before trying again.'
-  }
-});
-
-app.use(express.json({ limit: '10kb' })); // Restrict payload size to prevent payload flooding
-
-// --- API ROUTES ---
-
-app.get('/api/medicines', (req, res) => {
-  // Fetch medicines logic
-});
-
-// Apply strict rate limiting directly to the checkout route
-app.post('/api/sales', checkoutLimiter, (req, res) => {
-  // Process checkout logic
-});
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const Database = require('better-sqlite3');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const path = require('path');
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'pharmadawa_super_secret_key_2026';
-
-app.use(helmet());
-app.use(cors());
-app.use(express.json({ limit: '10kb' }));
-
-const db = new Database(path.join(__dirname, 'pharmadawa.db'));
-
-// --- DATABASE INITIALIZATION ---
-function initDatabase() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'pharmacist'
-    );
-  `);
-
-  // Seed default admin/pharmacist account if users table is empty
-  const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get();
-  if (userCount.count === 0) {
-    const hashedPassword = bcrypt.hashSync('PharmaDawa2026!', 10);
-    db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)')
-      .run('admin', hashedPassword, 'admin');
-    console.log('Seeded default user: admin / PharmaDawa2026!');
-  }
-}
-initDatabase();
-
-// --- AUTHENTICATION MIDDLEWARE ---
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  // Expect format: "Bearer <TOKEN>"
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access denied. No token provided.' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token.' });
-    }
-    req.user = user; // Attach decoded payload (id, username, role) to request
-    next();
-  });
-}
-
-// --- AUTHENTICATION ROUTES ---
-
-// 1. POST /api/login - Authenticate user & issue JWT
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid username or password' });
-  }
-
-  // Verify password against stored bcrypt hash
-  const validPassword = bcrypt.compareSync(password, user.password);
-  if (!validPassword) {
-    return res.status(401).json({ error: 'Invalid username or password' });
-  }
-
-  // Generate JWT signed with user payload (expires in 8 hours)
-  const token = jwt.sign(
-    { id: user.id, username: user.username, role: user.role },
-    JWT_SECRET,
-    { expiresIn: '8h' }
-  );
-
-  res.json({
-    message: 'Login successful',
-    token: token,
-    user: { id: user.id, username: user.username, role: user.role }
-  });
-});
-
-// --- PROTECTED PHARMADAWA ROUTES ---
-
-// Public or Protected: GET Medicines Catalog
-app.get('/api/medicines', (req, res) => {
-  const medicines = db.prepare('SELECT * FROM medicines').all();
-  res.json(medicines);
-});
-
-// Protected: POST /api/sales (Requires valid JWT)
-app.post('/api/sales', authenticateToken, (req, res) => {
-  // Access authenticated user via req.user
-  console.log(`Sale initiated by: ${req.user.username}`);
-  
-  // Checkout logic here...
-  res.status(201).json({ message: 'Sale completed under authenticated session.' });
-});
-
-// Protected: POST /api/medicines (Add Stock - Requires valid JWT)
-app.post('/api/medicines', authenticateToken, (req, res) => {
-  // Add medicine logic here...
-});
-
-app.listen(PORT, () => console.log(`PharmaDawa API running on port ${PORT}`));
-// PUT /api/medicines/:id - Update an existing medicine's details
-app.put('/api/medicines/:id', authenticateToken, requireAdmin, (req, res) => {
-  const { id } = req.params;
-  const { name, category, price, stock, expiry } = req.body;
-
-  if (!name || !category || price == null || stock == null || !expiry) {
-    return res.status(400).json({ error: 'All fields are required for update' });
-  }
-
-  try {
-    const stmt = db.prepare(
-      'UPDATE medicines SET name = ?, category = ?, price = ?, stock = ?, expiry = ? WHERE id = ?'
-    );
-    const result = stmt.run(name, category, price, stock, expiry, id);
-
-    if (result.changes === 0) {
-      return res.status(404).json({ error: 'Medicine not found' });
-    }
-
-    res.json({ message: 'Medicine updated successfully', id: Number(id), name, category, price, stock, expiry });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update medicine' });
-  }
-});
-
-// DELETE /api/medicines/:id - Remove a medicine from inventory
-app.delete('/api/medicines/:id', authenticateToken, requireAdmin, (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const stmt = db.prepare('DELETE FROM medicines WHERE id = ?');
-    const result = stmt.run(id);
-
-    if (result.changes === 0) {
-      return res.status(404).json({ error: 'Medicine not found' });
-    }
-
-    res.json({ message: 'Medicine deleted successfully', id: Number(id) });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete medicine' });
-  }
-});
-// GET /api/sales - Fetch all past sales transactions with itemized details
-app.get('/api/sales', authenticateToken, (req, res) => {
-  try {
-    const sales = db.prepare('SELECT * FROM sales ORDER BY created_at DESC').all();
-
-    const detailedSales = sales.map(sale => {
-      const items = db.prepare(`
-        SELECT si.quantity, si.price, m.name as medicine_name 
-        FROM sale_items si 
-        JOIN medicines m ON si.medicine_id = m.id 
-        WHERE si.sale_id = ?
-      `).all(sale.id);
-
-      return { ...sale, items };
-    });
-
-    res.json(detailedSales);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch sales history' });
-  }
-});
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5500',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 100,
-  standardHeaders: true, legacyHeaders: false,
-  message: { error: 'Too many requests, try again later.' }
-});
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 10,
-  message: { error: 'Too many login attempts.' }
-});
-const checkoutLimiter = rateLimit({
-  windowMs: 60 * 1000, max: 5,
-  message: { error: 'Too many transactions. Wait a moment.' }
-});
-app.use('/api', globalLimiter);
-// Get medicines with stock below a threshold (default: 10)
-app.get('/api/medicines/low-stock', authenticateToken, (req, res) => {
-  const threshold = parseInt(req.query.threshold) || 10;
-  const medicines = db.prepare('SELECT * FROM medicines WHERE stock <= ? ORDER BY stock ASC').all(threshold);
-  res.json(medicines);
-});
-const db = new Database(path.join(__dirname, 'pharmadawa.db'));
-
-// Enable WAL mode and set a busy timeout (waits 5 seconds for locks to clear instead of failing instantly)
-db.pragma('journal_mode = WAL');
-db.pragma('busy_timeout = 5000');
-const Joi = require('joi');
-
-// Validation Schemas
-const schemas = {
-  login: Joi.object({
-    username: Joi.string().alphanum().min(3).max(30).required(),
-    password: Joi.string().min(6).required(),
-  }),
-  medicine: Joi.object({
-    name: Joi.string().trim().min(2).max(100).required(),
-    category: Joi.string().trim().required(),
-    price: Joi.number().positive().required(),
-    stock: Joi.number().integer().min(0).required(),
-    expiry: Joi.string().isoDate().required(), // Validates YYYY-MM-DD
-  }),
-  sales: Joi.object({
-    items: Joi.array().items(
-      Joi.object({
-        medicineId: Joi.number().integer().positive().required(),
-        quantity: Joi.number().integer().positive().required(),
-        price: Joi.number().positive().required(),
-      })
-    ).min(1).required(),
-  }),
+const PORT = 3999;
+const BASE = `http://127.0.0.1:${PORT}`;
+const DB = path.join(os.tmpdir(), `pharmadawa-test-${Date.now()}.db`);
+const ADMIN_PW = 'TestPass#12345';
+
+let passed = 0, failed = 0;
+const check = (name, cond, extra = '') => {
+  if (cond) { passed++; console.log(`  PASS  ${name}`); }
+  else { failed++; console.log(`  FAIL  ${name} ${extra}`); }
 };
-
-// Middleware Generator
-const validateBody = (schemaKey) => {
-  return (req, res, next) => {
-    const { error } = schemas[schemaKey].validate(req.body, { abortEarly: false });
-    if (error) {
-      const details = error.details.map(err => err.message);
-      return res.status(400).json({ error: 'Validation failed', details });
-    }
-    next();
-  };
-};
-app.post('/api/auth/login', strictLimiter, validateBody('login'), (req, res) => { ... });
-app.post('/api/medicines', authenticateToken, validateBody('medicine'), (req, res) => { ... });
-app.post('/api/sales', authenticateToken, strictLimiter, validateBody('sales'), (req, res) => { ... });
-// 404 Route handler for unhandled endpoints
-app.use((req, res, next) => {
-  res.status(404).json({ error: `Route ${req.originalUrl} not found` });
-});
-
-// Centralised Error Handler Middleware
-app.use((err, req, res, next) => {
-  console.error(`[ERROR] ${new Date().toISOString()}:`, err.stack || err.message);
-
-  // If the error was explicitly thrown by our database transaction rules
-  if (err.message.includes('Insufficient stock') || err.message.includes('not found')) {
-    return res.status(400).json({ error: err.message });
-  }
-
-  // Generic fallback for unhandled exceptions
-  res.status(500).json({
-    error: process.env.NODE_ENV === 'production' 
-      ? 'An internal server error occurred.' 
-      : err.message
+async function api(method, url, { token, body, raw } = {}) {
+  const res = await fetch(BASE + url, {
+    method,
+    headers: { ...(body !== undefined && !raw ? { 'Content-Type': 'application/json' } : {}), ...(raw ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
   });
-});
-app.get('/api/medicines', authenticateToken, (req, res, next) => {
-  try {
-    const medicines = db.prepare('SELECT * FROM medicines').all();
-    res.json(medicines);
-  } catch (error) {
-    next(error); // Automatically routes to the central handler
-  }
-});
-app.get('/api/medicines', authenticateToken, (req, res, next) => {
-  try {
-    const medicines = db.prepare('SELECT * FROM medicines').all();
-    res.json(medicines);
-  } catch (error) {
-    next(error); // Automatically routes to the central handler
-  }
-});
-// Add to initDatabase() schema:
-db.exec(`
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    action TEXT NOT NULL,
-    details TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
-
-// Helper function to record audit events
-function logAudit(userId, action, details) {
-  try {
-    db.prepare('INSERT INTO audit_logs (user_id, action, details) VALUES (?, ?, ?)')
-      .run(userId, action, JSON.stringify(details));
-  } catch (err) {
-    console.error('Failed to write audit log:', err.message);
-  }
+  const type = res.headers.get('content-type') || '';
+  const data = type.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer());
+  return { status: res.status, data, type };
 }
-// GET /api/dashboard/stats - Aggregate metrics for the PharmaDawa admin dashboard
-app.get('/api/dashboard/stats', authenticateToken, (req, res, next) => {
+
+async function run() {
+  console.log('Health & auth');
+  check('health ok', (await api('GET', '/api/health')).data.status === 'ok');
+  check('no token -> 401', (await api('GET', '/api/medicines')).status === 401);
+  check('wrong password -> 401', (await api('POST', '/api/auth/login', { body: { username: 'admin', password: 'wrongpass' } })).status === 401);
+  const login = await api('POST', '/api/auth/login', { body: { username: 'admin', password: ADMIN_PW } });
+  check('admin login', login.status === 200 && !!login.data.token);
+  const admin = login.data.token;
+  check('legacy /api/login alias works', (await api('POST', '/api/login', { body: { username: 'admin', password: ADMIN_PW } })).status === 200);
+  check('malformed JSON -> 400', (await api('POST', '/api/auth/login', { raw: '{bad json' })).status === 400);
+
+  console.log('Inventory');
+  const meds = (await api('GET', '/api/medicines', { token: admin })).data;
+  check('6 seeded medicines', meds.length === 6);
+  const para = meds.find(m => m.name.startsWith('Paracetamol'));
+  const ibu = meds.find(m => m.name.startsWith('Ibuprofen'));
+  check('search works', (await api('GET', '/api/medicines?q=paracet', { token: admin })).data.length === 1);
+  check('bad id -> 400', (await api('PUT', '/api/medicines/abc', { token: admin, body: {} })).status === 400);
+  const badDate = { name: 'Test', category: 'X', price: 5, stock: 1, expiry: '2030-02-31' };
+  check('impossible date rejected', (await api('POST', '/api/medicines', { token: admin, body: badDate })).status === 400);
+  check('already-expired stock rejected', (await api('POST', '/api/medicines', { token: admin, body: { ...badDate, expiry: '2020-01-01' } })).status === 400);
+  const created = await api('POST', '/api/medicines', { token: admin, body: { ...badDate, expiry: '2035-01-01', barcode: 'BC-1' } });
+  check('create medicine', created.status === 201);
+  check('duplicate barcode -> 409', (await api('POST', '/api/medicines', { token: admin, body: { ...badDate, name: 'Test2', expiry: '2035-01-01', barcode: 'BC-1' } })).status === 409);
+  const bc = await api('GET', '/api/medicines/barcode/BC-1', { token: admin });
+  check('barcode lookup + sellable flag', bc.status === 200 && bc.data.sellable === true);
+
+  console.log('Sales');
+  const sale = await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: para.id, quantity: 2, price: 0.01 }] } });
+  check('sale created', sale.status === 201);
+  check('client price ignored (8.00 + 0.40 = 8.40)', sale.data.sale.subtotal === 8 && sale.data.sale.tax === 0.4 && sale.data.sale.total === 8.4);
+  const after = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === para.id);
+  check('stock deducted', after.stock === para.stock - 2);
+  check('oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: 9 }] } })).status === 400);
+  check('split-line oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: 5 }, { medicineId: ibu.id, quantity: 5 }] } })).status === 400);
+  const ibuAfter = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === ibu.id);
+  check('failed sales left stock untouched', ibuAfter.stock === ibu.stock);
+  const rcpt = await api('GET', `/api/sales/${sale.data.sale.saleId}/receipt`, { token: admin });
+  check('receipt is a PDF', rcpt.type.includes('application/pdf') && rcpt.data.slice(0, 4).toString() === '%PDF');
+
+  console.log('Void & expiry');
+  check('void sale', (await api('POST', `/api/sales/${sale.data.sale.saleId}/void`, { token: admin, body: { reason: 'Customer returned' } })).status === 200);
+  const restored = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === para.id);
+  check('stock restored after void', restored.stock === para.stock);
+  check('double void -> 409', (await api('POST', `/api/sales/${sale.data.sale.saleId}/void`, { token: admin, body: { reason: 'Again please' } })).status === 409);
+  await api('PUT', `/api/medicines/${created.data.id}`, { token: admin, body: { ...badDate, expiry: '2020-01-01', barcode: 'BC-1' } });
+  check('expired item cannot be sold', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: created.data.id, quantity: 1 }] } })).status === 400);
+  check('restock adds relative stock', (await api('POST', `/api/medicines/${para.id}/restock`, { token: admin, body: { quantity: 10 } })).data.stock === para.stock + 10);
+
+  console.log('Roles & sessions');
+  check('create pharmacist', (await api('POST', '/api/users', { token: admin, body: { username: 'Amina', password: 'Pharma#Pass1' } })).status === 201);
+  const ph = (await api('POST', '/api/auth/login', { body: { username: 'amina', password: 'Pharma#Pass1' } })).data.token;
+  check('pharmacist login (case-insensitive username)', !!ph);
+  check('pharmacist cannot add medicine -> 403', (await api('POST', '/api/medicines', { token: ph, body: { ...badDate, expiry: '2035-01-01' } })).status === 403);
+  check('pharmacist can sell', (await api('POST', '/api/sales', { token: ph, body: { items: [{ medicineId: para.id, quantity: 1 }] } })).status === 201);
+  const cp = await api('POST', '/api/auth/change-password', { token: ph, body: { currentPassword: 'Pharma#Pass1', newPassword: 'NewPharma#Pass2' } });
+  check('change password', cp.status === 200 && !!cp.data.token);
+  check('old token revoked after password change', (await api('GET', '/api/medicines', { token: ph })).status === 401);
+  check('new token works', (await api('GET', '/api/medicines', { token: cp.data.token })).status === 200);
+  const adminId = (await api('GET', '/api/users', { token: admin })).data.find(u => u.username === 'admin').id;
+  check('cannot delete self', (await api('DELETE', `/api/users/${adminId}`, { token: admin })).status === 400);
+  check('dashboard stats', (await api('GET', '/api/dashboard/stats', { token: admin })).data.success === true);
+  check('audit log readable by admin only', (await api('GET', '/api/audit-logs', { token: admin })).status === 200 && (await api('GET', '/api/audit-logs', { token: cp.data.token })).status === 403);
+  check('unknown route -> 404 JSON', (await api('GET', '/api/nope', { token: admin })).status === 404);
+
+  console.log('Brute-force protection');
+  let last;
+  for (let i = 0; i < 6; i++) last = await api('POST', '/api/auth/login', { body: { username: 'locktest', password: 'badbadbad' } });
+  check('account locked after repeated failures (429)', last.status === 429);
+}
+
+(async () => {
+  const server = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+    env: { ...process.env, PORT: String(PORT), DB_PATH: DB, ADMIN_PASSWORD: ADMIN_PW, JWT_SECRET: 'x'.repeat(40), NODE_ENV: 'test' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log = '';
+  server.stdout.on('data', d => (log += d));
+  server.stderr.on('data', d => (log += d));
   try {
-    // 1. Overall Inventory Statistics & Valuation
-    const inventoryStats = db.prepare(`
-      SELECT 
-        COUNT(*) as totalProducts, 
-        SUM(stock) as totalStockUnits, 
-        ROUND(SUM(price * stock), 2) as totalInventoryValue 
-      FROM medicines
-    `).get();
-
-    // 2. Low Stock Items Count (Threshold <= 10)
-    const lowStockCount = db.prepare(
-      'SELECT COUNT(*) as count FROM medicines WHERE stock <= 10'
-    ).get().count;
-
-    // 3. Today's Sales & Revenue
-    const todaySales = db.prepare(`
-      SELECT 
-        COUNT(*) as transactionsCount, 
-        ROUND(COALESCE(SUM(total), 0), 2) as totalRevenue 
-      FROM sales 
-      WHERE DATE(created_at) = DATE('now', 'localtime')
-    `).get();
-
-    // 4. Products Expiring Soon (Within the next 60 days)
-    const expiringSoonCount = db.prepare(`
-      SELECT COUNT(*) as count 
-      FROM medicines 
-      WHERE expiry BETWEEN DATE('now') AND DATE('now', '+60 days')
-    `).get().count;
-
-    res.json({
-      success: true,
-      data: {
-        inventory: inventoryStats,
-        lowStockCount,
-        todaySales,
-        expiringSoonCount
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-// GET /api/medicines/expiring-soon - Fetch medicines nearing their expiry date
-app.get('/api/medicines/expiring-soon', authenticateToken, (req, res, next) => {
-  try {
-    // Allow custom days via query parameter (e.g., /api/medicines/expiring-soon?days=30)
-    const days = parseInt(req.query.days) || 60;
-
-    const medicines = db.prepare(`
-      SELECT *, 
-             CAST(JULIANDAY(expiry) - JULIANDAY('now') AS INTEGER) as days_left
-      FROM medicines 
-      WHERE expiry BETWEEN DATE('now') AND DATE('now', ? || ' days')
-      ORDER BY expiry ASC
-    `).all(days);
-
-    res.json({
-      success: true,
-      windowDays: days,
-      count: medicines.length,
-      medicines
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-// GET /api/medicines/barcode/:barcode - Scan/Lookup medicine by barcode during POS checkout
-app.get('/api/medicines/barcode/:barcode', authenticateToken, (req, res, next) => {
-  try {
-    const { barcode } = req.params;
-    
-    const medicine = db.prepare('SELECT * FROM medicines WHERE barcode = ?').get(barcode);
-    
-    if (!medicine) {
-      return res.status(404).json({ error: 'No medicine found matching this barcode.' });
+    for (let i = 0; i < 50; i++) { // wait for startup
+      try { if ((await fetch(`${BASE}/api/health`)).ok) break; } catch {}
+      await new Promise(r => setTimeout(r, 200));
     }
-    
-    res.json({
-      success: true,
-      medicine
-    });
-  } catch (error) {
-    next(error);
+    await run();
+  } catch (e) {
+    failed++; console.log('  ERROR', e.stack || e);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise(r => setTimeout(r, 500));
+    for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) fs.rmSync(f, { force: true });
   }
-});
-// GET /api/medicines/barcode/:barcode - Scan/Lookup medicine by barcode during POS checkout
-app.get('/api/medicines/barcode/:barcode', authenticateToken, (req, res, next) => {
-  try {
-    const { barcode } = req.params;
-    
-    const medicine = db.prepare('SELECT * FROM medicines WHERE barcode = ?').get(barcode);
-    
-    if (!medicine) {
-      return res.status(404).json({ error: 'No medicine found matching this barcode.' });
-    }
-    
-    res.json({
-      success: true,
-      medicine
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-const PDFDocument = require('pdfkit');
-
-// GET /api/sales/:id/receipt - Generate and download a PDF receipt for a specific sale
-app.get('/api/sales/:id/receipt', authenticateToken, (req, res, next) => {
-  try {
-    const saleId = req.params.id;
-
-    // 1. Fetch transaction record
-    const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(saleId);
-    if (!sale) {
-      return res.status(404).json({ error: 'Sales transaction not found.' });
-    }
-
-    // 2. Fetch itemized products for this sale
-    const items = db.prepare(`
-      SELECT si.quantity, si.price, m.name as medicine_name 
-      FROM sale_items si 
-      JOIN medicines m ON si.medicine_id = m.id 
-      WHERE si.sale_id = ?
-    `).all(saleId);
-
-    // 3. Set HTTP headers to stream the PDF file
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename=PharmaDawa-Receipt-${saleId}.pdf`);
-
-    // 4. Initialize PDF document stream
-    const doc = new PDFDocument({ margin: 50 });
-    doc.pipe(res);
-
-    // Header styling
-    doc.fontSize(22).fillColor('#2c3e50').text('PharmaDawa Pharmacy', { align: 'center' });
-    doc.fontSize(10).fillColor('#7f8c8d').text('Official Sales & Tax Invoice', { align: 'center' });
-    doc.moveDown(1.5);
-
-    // Transaction Details
-    doc.fontSize(10).fillColor('#333333');
-    doc.text(`Receipt ID: #${sale.id}`, { continued: true });
-    doc.text(`Date: ${sale.created_at}`, { align: 'right' });
-    doc.moveDown();
-
-    // Table Header Separator
-    doc.moveTo(50, doc.y).lineTo(550, doc.y).strokeColor('#bdc3c7').stroke();
-    doc.moveDown(0.5);
-
-    // Table Column Headers
-    doc.font('Helvetica-Bold');
-    doc.text('Item Description', 50, doc.y, { continued: true, width: 220 });
-    doc.text('Qty', 280, doc.y, { continued: true, width: 50 });
-    doc.text('Price', 350, doc.y, { continued: true, width: 80 });
-    doc.text('Total', 450, doc.y);
-    doc.font('Helvetica');
-    doc.moveDown(0.5);
-
-    // Render Line Items
-    items.forEach(item => {
-      const itemTotal = (item.quantity * item.price).toFixed(2);
-      doc.text(item.medicine_name, 50, doc.y, { continued: true, width: 220 });
-      doc.text(item.quantity.toString(), 280, doc.y, { continued: true, width: 50 });
-      doc.text(`$${item.price.toFixed(2)}`, 350, doc.y, { continued: true, width: 80 });
-      doc.text(`$${itemTotal}`, 450, doc.y);
-      doc.moveDown(0.5);
-    });
-
-    doc.moveTo(50, doc.y).lineTo(550, doc.y).strokeColor('#bdc3c7').stroke();
-    doc.moveDown(1);
-
-    // Totals Section (Right aligned)
-    doc.text(`Subtotal: $${sale.subtotal.toFixed(2)}`, { align: 'right' });
-    doc.text(`Tax (5%): $${sale.tax.toFixed(2)}`, { align: 'right' });
-    doc.fontSize(12).font('Helvetica-Bold').text(`Total Amount: $${sale.total.toFixed(2)}`, { align: 'right' });
-    doc.moveDown(2.5);
-
-    // Footer Message
-    doc.fontSize(9).font('Helvetica-Oblique').fillColor('#95a5a6')
-       .text('Thank you for shopping at PharmaDawa. Get well soon!', { align: 'center' });
-
-    doc.end();
-  } catch (error) {
-    next(error);
-  }
-});
+  console.log(`\n${passed} passed, ${failed} failed`);
+  if (failed) console.log('\nServer log:\n' + log);
+  process.exit(failed ? 1 : 0);
+})();
