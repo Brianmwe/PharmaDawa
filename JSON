@@ -1,54 +1,19 @@
-[
-  {
-    "id": 101,
-    "name": "Amoxicillin 500mg",
-    "category": "Antibiotic",
-    "price": 12.50,
-    "stock": 45,
-    "expiry": "2026-11-15"
-  }
-]
 {
   "name": "pharmadawa-backend",
-  "version": "1.0.0",
-  "description": "Pharmacy Management System Backend",
+  "version": "2.0.0",
+  "description": "REST API for the PharmaDawa pharmacy system: inventory, point-of-sale, receipts and user management.",
+  "keywords": ["pharmacy", "inventory", "pos", "express", "sqlite"],
+  "license": "UNLICENSED",
+  "private": true,
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+  "engines": {
+    "node": ">=18"
   },
-  "dependencies": {
-    "better-sqlite3": "^11.0.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
-  }
-}
-{
-  "name": "pharmadawa-backend",
-  "version": "1.0.0",
-  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.0.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.2.0",
-    "helmet": "^7.1.0",
-    "jsonwebtoken": "^9.0.2"
-  }
-}
-{
-  "name": "pharmadawa-backend",
-  "version": "1.0.0",
-  "description": "Pharmacy Management System Backend",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check smoke-test.js",
+    "test": "node smoke-test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -58,6 +23,7 @@
     "express-rate-limit": "^7.2.0",
     "helmet": "^7.1.0",
     "joi": "^17.12.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pdfkit": "^0.15.0"
   }
 }
