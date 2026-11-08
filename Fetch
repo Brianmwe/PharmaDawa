@@ -1,345 +1,208 @@
-// 1. Login Function
-async function login(username, password) {
-  const res = await fetch('http://localhost:3000/api/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password })
-  });
+/**
+ * pharmadawa-api.js: the single fetch layer for the Pharmadawa frontend.
+ *
+ * Load it before any other script:  <script src="pharmadawa-api.js"></script>
+ * It never shows alerts or touches the page (except the optional spinner).
+ * Every function returns data or throws an ApiError; the calling code decides
+ * how to display the message (use textContent, never innerHTML, for error text).
+ *
+ * Client-side checks here are for safety and convenience only. The server must
+ * enforce the same rules, because anyone can bypass this file.
+ */
 
-  const data = await res.json();
-  if (res.ok) {
-    localStorage.setItem('pharmadawa_token', data.token);
-    alert('Logged in successfully!');
-  } else {
-    alert(data.error);
+const PharmaAPI = (() => {
+  'use strict';
+
+  const BASE_URL = 'http://localhost:3000/api'; // production: use your https:// API URL
+  const TOKEN_KEY = 'pharmadawa_token';
+  const LOGIN_PAGE = '/login.html';
+  const TIMEOUT_MS = 15000;
+
+  // ---------- Errors ----------
+  class ApiError extends Error {
+    constructor(message, status = 0) {
+      super(message);
+      this.name = 'ApiError';
+      this.status = status;
+    }
   }
-}
 
-// 2. Protected Request (e.g., Checkout)
-async function checkout(cartItems) {
-  const token = localStorage.getItem('pharmadawa_token');
-
-  const res = await fetch('http://localhost:3000/api/sales', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}` // Attach JWT Token
-    },
-    body: JSON.stringify({ items: cartItems })
-  });
-
-  if (res.status === 401 || res.status === 403) {
-    alert('Session expired. Please log in again.');
-  }
-}
-const API_BASE_URL = 'http://localhost:3000/api';
-
-async function apiRequest(endpoint, options = {}) {
-  const token = localStorage.getItem('pharmadawa_token');
-
-  // Set up default headers and automatically attach token if available
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(token && { 'Authorization': `Bearer ${token}` }),
-    ...options.headers,
+  // ---------- Token storage ----------
+  const getToken = () => {
+    try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
+  };
+  const setToken = (token) => {
+    try { localStorage.setItem(TOKEN_KEY, token); } catch { /* storage blocked */ }
+  };
+  const clearToken = () => {
+    try { localStorage.removeItem(TOKEN_KEY); } catch { /* storage blocked */ }
   };
 
-  const res = await fetch(`${API_BASE_URL}${endpoint}`, {
-    ...options,
-    headers,
-  });
-
-  // Handle expired or unauthorized sessions globally
-  if (res.status === 401 || res.status === 403) {
-    localStorage.removeItem('pharmadawa_token');
-    alert('Session expired. Please log in again.');
-    // Optional: window.location.href = '/login.html';
-    throw new Error('Unauthorized');
+  // ---------- Loading spinner (counts overlapping requests) ----------
+  let pending = 0;
+  function setLoading(on) {
+    pending = Math.max(0, pending + (on ? 1 : -1));
+    const el = document.getElementById('loading-spinner');
+    if (el) el.style.display = pending > 0 ? 'block' : 'none';
   }
 
-  const data = await res.json();
-
-  if (!res.ok) {
-    throw new Error(data.error || 'Something went wrong');
+  // ---------- Input helpers ----------
+  function toPositiveInt(value, label) {
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n <= 0) {
+      throw new ApiError(`${label} must be a positive whole number`, 400);
+    }
+    return n;
   }
 
-  return data;
-}
-// 1. Login Function (Cleaned up)
-async function login(username, password) {
-  try {
-    const data = await apiRequest('/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password })
-    });
-
-    localStorage.setItem('pharmadawa_token', data.token);
-    alert('Logged in successfully!');
-  } catch (err) {
-    alert(err.message);
+  function clampInt(value, min, max, fallback) {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
   }
-}
 
-// 2. Protected Request / Checkout (Cleaned up)
-async function checkout(cartItems) {
-  try {
-    const data = await apiRequest('/sales', {
-      method: 'POST',
-      body: JSON.stringify({ items: cartItems })
-    });
+  // Blocks double-clicks: the same action can't run twice at once
+  const busy = new Set();
+  async function once(key, fn) {
+    if (busy.has(key)) throw new ApiError('Please wait, this request is already in progress.', 0);
+    busy.add(key);
+    try { return await fn(); } finally { busy.delete(key); }
+  }
 
-    alert('Checkout completed successfully!');
+  // ---------- Core request ----------
+  async function request(endpoint, { method = 'GET', body, auth = true } = {}) {
+    if (typeof endpoint !== 'string' || !endpoint.startsWith('/')) {
+      throw new ApiError('Invalid endpoint', 400);
+    }
+
+    const headers = { Accept: 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const token = auth ? getToken() : null;
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    setLoading(true);
+
+    try {
+      let res;
+      try {
+        res = await fetch(BASE_URL + endpoint, {
+          method,
+          headers,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+          cache: 'no-store', // never serve stock or sales data from the browser cache
+        });
+      } catch (err) {
+        throw new ApiError(
+          err.name === 'AbortError'
+            ? 'The request timed out. Please try again.'
+            : 'Cannot reach the server. Check your connection.'
+        );
+      }
+
+      let data = null;
+      try { data = await res.json(); } catch { /* server sent no JSON (e.g. a proxy error page) */ }
+
+      // 401 = missing, invalid, or expired login. (A wrong password on /login is not an expired session.)
+      if (res.status === 401 && auth) {
+        clearToken();
+        if (!location.pathname.endsWith(LOGIN_PAGE)) location.replace(LOGIN_PAGE);
+        throw new ApiError('Session expired. Please log in again.', 401);
+      }
+
+      // 403 = logged in but not allowed (e.g. a cashier on an admin action). Keep the session.
+      if (res.status === 403) {
+        throw new ApiError(data?.error || 'You do not have permission to do that.', 403);
+      }
+
+      if (!res.ok) throw new ApiError(data?.error || `Request failed (${res.status})`, res.status);
+      return data;
+    } finally {
+      clearTimeout(timer);
+      setLoading(false);
+    }
+  }
+
+  // ---------- Auth ----------
+  async function login(username, password) {
+    if (typeof username !== 'string' || !username.trim() || typeof password !== 'string' || !password) {
+      throw new ApiError('Enter your username and password', 400);
+    }
+    const data = await once('login', () =>
+      request('/login', { method: 'POST', body: { username: username.trim(), password }, auth: false })
+    );
+    if (typeof data?.token !== 'string' || !data.token) {
+      throw new ApiError('Login failed: invalid server response', 500);
+    }
+    setToken(data.token);
     return data;
-  } catch (err) {
-    // 401/403 are handled globally, other errors are caught here
-    console.error(err);
   }
-}
-const API_BASE_URL = 'http://localhost:3000/api';
 
-// Optional: A global loading indicator toggle
-function setLoading(isLoading) {
-  const spinner = document.getElementById('loading-spinner');
-  if (spinner) {
-    spinner.style.display = isLoading ? 'block' : 'none';
+  function logout() {
+    clearToken();
+    location.replace(LOGIN_PAGE);
   }
-}
 
-async function apiRequest(endpoint, options = {}) {
-  const token = localStorage.getItem('pharmadawa_token');
+  const isLoggedIn = () => Boolean(getToken());
 
-  const headers = {
-    'Content-Type': 'application/json',
-    ...(token && { 'Authorization': `Bearer ${token}` }),
-    ...options.headers,
-  };
+  // ---------- Medicines ----------
+  function searchMedicines({ search = '', page = 1, limit = 20 } = {}) {
+    const params = new URLSearchParams();
+    const term = String(search).trim().slice(0, 100);
+    if (term) params.set('search', term);
+    params.set('page', clampInt(page, 1, 100000, 1));
+    params.set('limit', clampInt(limit, 1, 100, 20));
+    return request(`/medicines?${params}`);
+  }
 
-  // Show loading spinner before starting the fetch
-  setLoading(true);
+  // Admin only (the server enforces this)
+  function restockMedicine(medicineId, quantity) {
+    const id = toPositiveInt(medicineId, 'Medicine ID');
+    const qty = toPositiveInt(quantity, 'Quantity');
+    return once(`restock:${id}`, () =>
+      request(`/medicines/${id}/restock`, { method: 'PATCH', body: { quantity: qty } })
+    );
+  }
 
-  try {
-    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
-      headers,
-    });
-
-    // Handle expired or unauthorized sessions globally
-    if (res.status === 401 || res.status === 403) {
-      localStorage.removeItem('pharmadawa_token');
-      alert('Session expired. Please log in again.');
-      
-      // Automatically redirect to login page
-      window.location.href = '/login.html'; 
-      throw new Error('Unauthorized');
+  // ---------- Sales ----------
+  // Sends only medicine IDs and quantities. Prices and totals are always set by the server.
+  function checkout(cartItems) {
+    if (!Array.isArray(cartItems) || cartItems.length === 0) {
+      throw new ApiError('Cart is empty', 400);
     }
 
-    const data = await res.json();
-
-    if (!res.ok) {
-      throw new Error(data.error || 'Something went wrong');
+    // Validate every line and merge duplicates so the same medicine can't be split across lines
+    const merged = new Map();
+    for (const item of cartItems) {
+      const id = toPositiveInt(item?.medicine_id, 'Medicine ID');
+      const qty = toPositiveInt(item?.quantity, 'Quantity');
+      merged.set(id, (merged.get(id) || 0) + qty);
     }
+    const items = [...merged].map(([medicine_id, quantity]) => ({ medicine_id, quantity }));
 
-    return data;
-  } finally {
-    // Always hide the loading spinner whether the request succeeds or fails
-    setLoading(false);
+    return once('checkout', () => request('/sales', { method: 'POST', body: { items } }));
   }
-}
-// 1. Login
-async function login(username, password) {
-  const data = await api('/login', {
-    method: 'POST',
-    body: JSON.stringify({ username, password })
+
+  function getSale(saleId) {
+    return request(`/sales/${toPositiveInt(saleId, 'Sale ID')}`);
+  }
+
+  // Admin only (the server enforces this). Ask for confirmation in your UI before calling.
+  function voidSale(saleId) {
+    const id = toPositiveInt(saleId, 'Sale ID');
+    return once(`void:${id}`, () => request(`/sales/${id}/void`, { method: 'POST' }));
+  }
+
+  return Object.freeze({
+    ApiError,
+    login,
+    logout,
+    isLoggedIn,
+    searchMedicines,
+    restockMedicine,
+    checkout,
+    getSale,
+    voidSale,
   });
-
-  if (data?.token) {
-    localStorage.setItem('pharmadawa_token', data.token);
-    alert('Welcome back!');
-    window.location.href = '/dashboard.html';
-  }
-}
-
-// 2. Checkout
-async function checkout(cartItems) {
-  const data = await api('/sales', {
-    method: 'POST',
-    body: JSON.stringify({ items: cartItems })
-  });
-
-  if (data) {
-    alert('Order placed successfully!');
-  }
-}
-// Restock without resending the whole medicine
-app.patch('/api/medicines/:id/restock', authenticateToken, requireAdmin, (req, res) => {
-  const qty = req.body.quantity;
-  if (!Number.isInteger(qty) || qty <= 0) {
-    return res.status(400).json({ error: 'Quantity must be a positive whole number' });
-  }
-  const r = db.prepare('UPDATE medicines SET stock = stock + ? WHERE id = ?').run(qty, req.params.id);
-  if (r.changes === 0) return res.status(404).json({ error: 'Medicine not found' });
-  res.json(db.prepare('SELECT * FROM medicines WHERE id = ?').get(req.params.id));
-});
-
-// Single sale for receipts
-app.get('/api/sales/:id', authenticateToken, (req, res) => {
-  const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(req.params.id);
-  if (!sale) return res.status(404).json({ error: 'Sale not found' });
-  sale.items = db.prepare(`
-    SELECT si.quantity, si.price, m.name AS medicine_name
-    FROM sale_items si JOIN medicines m ON si.medicine_id = m.id
-    WHERE si.sale_id = ?`).all(sale.id);
-  res.json(sale);
-});
-
-// Void a sale and put stock back
-const voidSale = db.transaction((id) => {
-  const sale = db.prepare('SELECT * FROM sales WHERE id = ?').get(id);
-  if (!sale) throw new Error('Sale not found');
-  if (sale.voided) throw new Error('Sale already voided');
-  const items = db.prepare('SELECT medicine_id, quantity FROM sale_items WHERE sale_id = ?').all(id);
-  const restock = db.prepare('UPDATE medicines SET stock = stock + ? WHERE id = ?');
-  items.forEach(i => restock.run(i.quantity, i.medicine_id));
-  db.prepare('UPDATE sales SET voided = 1 WHERE id = ?').run(id);
-});
-
-app.post('/api/sales/:id/void', authenticateToken, requireAdmin, (req, res) => {
-  try {
-    voidSale(req.params.id);
-    res.json({ message: 'Sale voided and stock restored' });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-// Create a new sale and deduct stock (wrapped in a transaction)
-const createSale = db.transaction((items) => {
-  // 1. Insert into sales table
-  const saleInfo = db.prepare('INSERT INTO sales (created_at) VALUES (CURRENT_TIMESTAMP)').run();
-  const saleId = saleInfo.lastInsertRowid;
-
-  const insertItem = db.prepare('INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)');
-  const updateStock = db.prepare('UPDATE medicines SET stock = stock - ? WHERE id = ?');
-  const getMedicine = db.prepare('SELECT stock, price FROM medicines WHERE id = ?');
-
-  for (const item of items) {
-    const med = getMedicine.get(item.medicine_id);
-    if (!med) throw new Error(`Medicine ID ${item.medicine_id} not found`);
-    if (med.stock < item.quantity) throw new Error(`Insufficient stock for medicine ID ${item.medicine_id}`);
-
-    // Update stock and insert sale item
-    updateStock.run(item.quantity, item.medicine_id);
-    insertItem.run(saleId, item.medicine_id, item.quantity, med.price);
-  }
-  return saleId;
-});
-
-app.post('/api/sales', authenticateToken, (req, res) => {
-  try {
-    const { items } = req.body;
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: 'Cart is empty' });
-    }
-    const saleId = createSale(items);
-    res.status(201).json({ message: 'Sale completed', saleId });
-  } catch (e) {
-    res.status(400).json({ error: e.message });
-  }
-});
-// Admin: Restock a medicine
-async function restockMedicine(medicineId, quantity) {
-  try {
-    const updatedMedicine = await apiRequest(`/medicines/${medicineId}/restock`, {
-      method: 'PATCH',
-      body: JSON.stringify({ quantity })
-    });
-    alert(`Successfully restocked ${updatedMedicine.name}. New stock: ${updatedMedicine.stock}`);
-  } catch (err) {
-    alert(`Restock failed: ${err.message}`);
-  }
-}
-
-// Admin: Void a sale
-async function voidSale(saleId) {
-  if (!confirm('Are you sure you want to void this sale and restore inventory?')) return;
-  
-  try {
-    const result = await apiRequest(`/sales/${saleId}/void`, {
-      method: 'POST'
-    });
-    alert(result.message);
-  } catch (err) {
-    alert(`Void failed: ${err.message}`);
-  }
-}
-// Backend: GET /api/medicines?search=paracetamol&page=1&limit=20
-app.get('/api/medicines', authenticateToken, (req, res) => {
-  const { search = '', page = 1, limit = 20 } = req.query;
-  const offset = (page - 1) * limit;
-
-  const medicines = db.prepare(`
-    SELECT * FROM medicines 
-    WHERE name LIKE ? 
-    LIMIT ? OFFSET ?
-  `).all(`%${search}%`, Number(limit), Number(offset));
-
-  res.json(medicines);
-});
-const createSale = db.transaction((items) => {
-  let subtotal = 0;
-  const getMedicine = db.prepare('SELECT stock, price FROM medicines WHERE id = ?');
-
-  // 1. First pass: Validate stock and calculate subtotal securely on server
-  for (const item of items) {
-    const med = getMedicine.get(item.medicine_id);
-    if (!med) throw new Error(`Medicine ID ${item.medicine_id} not found`);
-    if (med.stock < item.quantity) throw new Error(`Insufficient stock for medicine ID ${item.medicine_id}`);
-    subtotal += med.price * item.quantity;
-  }
-
-  const tax = subtotal * 0.05; // 5% tax example
-  const total = subtotal + tax;
-
-  // 2. Insert master record with financial totals
-  const saleInfo = db.prepare(
-    'INSERT INTO sales (subtotal, tax, total, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)'
-  ).run(subtotal, tax, total);
-  
-  const saleId = saleInfo.lastInsertRowid;
-
-  const insertItem = db.prepare('INSERT INTO sale_items (sale_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)');
-  const updateStock = db.prepare('UPDATE medicines SET stock = stock - ? WHERE id = ?');
-
-  // 3. Second pass: Mutate inventory and record items
-  for (const item of items) {
-    const med = getMedicine.get(item.medicine_id);
-    updateStock.run(item.quantity, item.medicine_id);
-    insertItem.run(saleId, item.medicine_id, item.quantity, med.price);
-  }
-
-  return { saleId, subtotal, tax, total };
-});
-function showNotification(message, type = 'success') {
-  let container = document.getElementById('toast-container');
-  if (!container) {
-    container = document.createElement('div');
-    container.id = 'toast-container';
-    container.style.cssText = 'position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px;';
-    document.body.appendChild(container);
-  }
-
-  const toast = document.createElement('div');
-  toast.className = `toast toast-${type}`;
-  toast.style.cssText = `
-    background: ${type === 'error' ? '#ef4444' : '#10b981'};
-    color: white; padding: 12px 20px; border-radius: 6px; 
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1); font-family: sans-serif;
-    transition: opacity 0.3s ease;
-  `;
-  toast.textContent = message;
-  container.appendChild(toast);
-
-  setTimeout(() => {
-    toast.style.opacity = '0';
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
-}
+})();
