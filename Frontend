@@ -695,3 +695,13 @@ check('GET /api/config works', (await api('GET', '/api/config', { token: admin }
     }
   })();
 })();
+async function api(method, url, { token, body, raw } = {}) {
+  const payload = raw ?? (body !== undefined ? JSON.stringify(body) : undefined);
+  const headers = {};
+  if (payload !== undefined) headers['Content-Type'] = 'application/json';
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch(BASE + url, { method, headers, body: payload });
+  const type = res.headers.get('content-type') || '';
+  const data = type.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer());
+  return { status: res.status, data, type };
+}
