@@ -120,3 +120,22 @@ async function run() {
   if (failed) console.log('\nServer log:\n' + log);
   process.exit(failed ? 1 : 0);
 })();
+// login: use the real route
+request('/auth/login', { method: 'POST', body: { username: username.trim().toLowerCase(), password }, auth: false })
+
+// search: server expects ?q=
+if (term) params.set('q', term);
+
+// restock: server expects POST
+request(`/medicines/${id}/restock`, { method: 'POST', body: { quantity: qty } })
+
+// checkout: server expects medicineId (camelCase)
+const items = [...merged].map(([medicineId, quantity]) => ({ medicineId, quantity }));
+// ...and read item?.medicineId in the loop above it
+
+// void: server requires a reason
+function voidSale(saleId, reason) {
+  const id = toPositiveInt(saleId, 'Sale ID');
+  if (typeof reason !== 'string' || reason.trim().length < 3) throw new ApiError('Enter a reason (3+ characters)', 400);
+  return once(`void:${id}`, () => request(`/sales/${id}/void`, { method: 'POST', body: { reason: reason.trim() } }));
+}
