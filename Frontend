@@ -569,6 +569,16 @@
       openForm({
         title: `Void sale #${s.id}`, intro: 'This returns the items to stock and removes the sale from revenue. It cannot be undone.', submitLabel: 'Void sale', danger: true,
         fields: [{ name: 'reason', label: 'Reason', minlength: 3, maxlength: 200 }],
+check('limit=5000 accepted', (await api('GET', '/api/medicines?limit=5000', { token: admin })).status === 200);
+const key = 'test-key-' + Date.now();
+const s1 = await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: probe, quantity: 1 }] } });
+// idempotency needs the header, so call fetch directly:
+const idem = (k) => fetch(BASE + '/api/sales', { method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${admin}`, 'Idempotency-Key': k },
+  body: JSON.stringify({ items: [{ medicineId: probe, quantity: 1 }] }) }).then(async r => ({ status: r.status, data: await r.json() }));
+const a = await idem(key), b = await idem(key);
+check('idempotent replay returns same sale', a.data.sale.saleId === b.data.sale.saleId && b.data.replayed === true);
+check('GET /api/config works', (await api('GET', '/api/config', { token: admin })).status === 200);
         onSubmit: async (v) => { await api(`/sales/${s.id}/void`, { method: 'POST', body: { reason: v.reason.trim() } }); toast('Sale voided.', 'success'); load(); refreshMedicines().catch(() => {}); },
       });
     }
