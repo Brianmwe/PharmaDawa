@@ -719,3 +719,4 @@ onSubmit: async (v) => {
   if (v.newPassword !== v.confirm) throw new Error('The new passwords do not match.');
   if (pwTooLong(v.newPassword)) throw new Error('Password is too long (72 bytes max; non-English characters count extra).');
   // ...
+
