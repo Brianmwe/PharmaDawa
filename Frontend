@@ -715,3 +715,7 @@ const idem = (k) => fetch(BASE + '/api/sales', { method: 'POST',
 const a = await idem(key), b = await idem(key);
 check('idempotent replay returns same sale', a.data.sale.saleId === b.data.sale.saleId && b.data.replayed === true);
 check('GET /api/config works', (await api('GET', '/api/config', { token: admin })).status === 200):
+onSubmit: async (v) => {
+  if (v.newPassword !== v.confirm) throw new Error('The new passwords do not match.');
+  if (pwTooLong(v.newPassword)) throw new Error('Password is too long (72 bytes max; non-English characters count extra).');
+  // ...
