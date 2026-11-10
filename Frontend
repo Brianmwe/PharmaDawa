@@ -720,3 +720,8 @@ onSubmit: async (v) => {
   if (pwTooLong(v.newPassword)) throw new Error('Password is too long (72 bytes max; non-English characters count extra).');
   // ...
 
+} catch (ex) {
+  state.token = null; store.del(TOKEN_KEY);
+  err.textContent = formatErr(ex);
+  btn.disabled = false; btn.textContent = 'Sign in';
+}
