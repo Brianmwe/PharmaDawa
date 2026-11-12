@@ -1,4 +1,3 @@
-
 'use strict';
 // PharmaDawa frontend. Zero dependencies, zero innerHTML, zero inline handlers:
 // every piece of dynamic text is inserted as a text node, so injected markup can never execute.
