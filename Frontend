@@ -760,3 +760,62 @@ fs.writeFileSync(
 );
 console.log('Admin password (shown once):', adminPassword);
 console.log('.env written with permissions 600.');
+ const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const SECRET = process.env.JWT_SECRET; // 32+ random bytes
+if (!SECRET || Buffer.byteLength(SECRET) < 32) throw new Error('JWT_SECRET too weak');
+
+const OPTS = { algorithm: 'HS256', issuer: 'pharmadawa', audience: 'pharmadawa-web' };
+
+const signAccess = (u) => jwt.sign(
+  { role: u.role, tv: u.tokenVersion },
+  SECRET,
+  { ...OPTS, subject: String(u.id), expiresIn: '10m', jwtid: crypto.randomUUID() }
+);
+
+async function requireAuth(req, res, next) {
+  try {
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+    if (!m) throw new Error();
+    const p = jwt.verify(m[1], SECRET, {
+      algorithms: ['HS256'], issuer: OPTS.issuer, audience: OPTS.audience, clockTolerance: 5,
+    });
+    const user = await db.users.findById(p.sub);      // re-check every request
+    if (!user || user.disabled || user.tokenVersion !== p.tv) throw new Error();
+    req.user = user;                                   // role comes from DB, not the token
+    next();
+  } catch { res.status(401).json({ error: 'Unauthorized' }); }
+}
+
+// Refresh token: opaque, random, stored hashed, rotated on every use
+const hash = (t) => crypto.createHash('sha256').update(t).digest('hex');
+const COOKIE = { httpOnly: true, secure: true, sameSite: 'strict', path: '/api/auth', maxAge: 8 * 3600e3 };
+
+async function issueRefresh(res, user, family = crypto.randomUUID()) {
+  const token = crypto.randomBytes(48).toString('base64url');
+  await db.refresh.insert({ hash: hash(token), userId: user.id, family, expires: Date.now() + COOKIE.maxAge });
+  res.cookie('pd_refresh', token, COOKIE);
+}
+
+app.post('/api/auth/refresh', async (req, res) => {
+  if (req.get('X-Requested-With') !== 'pharmadawa') return res.status(403).end(); // CSRF guard
+  const t = req.cookies.pd_refresh;
+  const row = t && await db.refresh.findByHash(hash(t));
+  if (!row || row.expires < Date.now()) return res.status(401).json({ error: 'Session expired' });
+  if (row.used) {                                      // reuse = theft: kill the whole family
+    await db.refresh.revokeFamily(row.family);
+    return res.status(401).json({ error: 'Session revoked' });
+  }
+  await db.refresh.markUsed(row.hash);
+  const user = await db.users.findById(row.userId);
+  if (!user || user.disabled) return res.status(401).end();
+  await issueRefresh(res, user, row.family);
+  res.json({ token: signAccess(user) });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const row = await db.refresh.findByHash(hash(req.cookies.pd_refresh || ''));
+  if (row) await db.refresh.revokeFamily(row.family);
+  res.clearCookie('pd_refresh', { path: '/api/auth' }).json({ ok: true });
+});
