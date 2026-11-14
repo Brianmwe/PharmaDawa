@@ -1,3 +1,2 @@
-# 💊 PharmaDawa 
-
-A secure, enterprise-ready RESTful API for pharmacy inventory management and point-of-sale (POS) operations
+💊 PharmaDawa 
+A private Pharmacy Inventory Management System and Point-Of-Sale services for efficient stock management and tracking 
