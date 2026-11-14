@@ -1,98 +1,149 @@
+'use strict';
+// Integration tests for the PharmaDawa API. Requires Node 18+ (global fetch, AbortSignal.timeout).
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const PORT = 3999;
+const PORT = Number(process.env.TEST_PORT) || 3999;
 const BASE = `http://127.0.0.1:${PORT}`;
-const DB = path.join(os.tmpdir(), `pharmadawa-test-${Date.now()}.db`);
+const DB = path.join(os.tmpdir(), `pharmadawa-test-${process.pid}-${Date.now()}.db`);
 const ADMIN_PW = 'TestPass#12345';
+const TAX_RATE = 0.05;
 
-let passed = 0, failed = 0;
-const check = (name, cond, extra = '') => {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const money = (n) => Math.round(n * 100) / 100;
+
+let passed = 0;
+let failed = 0;
+function check(name, cond, extra = '') {
   if (cond) { passed++; console.log(`  PASS  ${name}`); }
   else { failed++; console.log(`  FAIL  ${name} ${extra}`); }
-};
+}
+
 async function api(method, url, { token, body, raw } = {}) {
-  const res = await fetch(BASE + url, {
-    method,
-    headers: { ...(body !== undefined && !raw ? { 'Content-Type': 'application/json' } : {}), ...(raw ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
-  });
+  const headers = {};
+  let payload;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (raw !== undefined) { payload = raw; headers['Content-Type'] = 'application/json'; }
+  else if (body !== undefined) { payload = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
+
+  const res = await fetch(BASE + url, { method, headers, body: payload, signal: AbortSignal.timeout(10_000) });
   const type = res.headers.get('content-type') || '';
-  const data = type.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer());
+  const data = type.includes('json')
+    ? await res.json().catch(() => null)
+    : Buffer.from(await res.arrayBuffer());
   return { status: res.status, data, type };
 }
 
+const login = (username, password) => api('POST', '/api/auth/login', { body: { username, password } });
+const listMeds = async (token) => (await api('GET', '/api/medicines', { token })).data;
+
 async function run() {
   console.log('Health & auth');
-  check('health ok', (await api('GET', '/api/health')).data.status === 'ok');
+  check('health ok', (await api('GET', '/api/health')).data?.status === 'ok');
   check('no token -> 401', (await api('GET', '/api/medicines')).status === 401);
-  check('wrong password -> 401', (await api('POST', '/api/auth/login', { body: { username: 'admin', password: 'wrongpass' } })).status === 401);
-  const login = await api('POST', '/api/auth/login', { body: { username: 'admin', password: ADMIN_PW } });
-  check('admin login', login.status === 200 && !!login.data.token);
-  const admin = login.data.token;
+  check('wrong password -> 401', (await login('admin', 'wrongpass')).status === 401);
+  const adminLogin = await login('admin', ADMIN_PW);
+  check('admin login', adminLogin.status === 200 && !!adminLogin.data?.token);
+  const admin = adminLogin.data?.token;
   check('legacy /api/login alias works', (await api('POST', '/api/login', { body: { username: 'admin', password: ADMIN_PW } })).status === 200);
   check('malformed JSON -> 400', (await api('POST', '/api/auth/login', { raw: '{bad json' })).status === 400);
 
   console.log('Inventory');
-  const meds = (await api('GET', '/api/medicines', { token: admin })).data;
-  check('6 seeded medicines', meds.length === 6);
-  const para = meds.find(m => m.name.startsWith('Paracetamol'));
-  const ibu = meds.find(m => m.name.startsWith('Ibuprofen'));
+  const meds = await listMeds(admin);
+  check('6 seeded medicines', meds.length === 6, `(got ${meds.length})`);
+  const para = meds.find((m) => m.name.startsWith('Paracetamol'));
+  const ibu = meds.find((m) => m.name.startsWith('Ibuprofen'));
+  if (!para || !ibu) throw new Error('Seed data missing Paracetamol/Ibuprofen; cannot continue');
+
   check('search works', (await api('GET', '/api/medicines?q=paracet', { token: admin })).data.length === 1);
   check('bad id -> 400', (await api('PUT', '/api/medicines/abc', { token: admin, body: {} })).status === 400);
-  const badDate = { name: 'Test', category: 'X', price: 5, stock: 1, expiry: '2030-02-31' };
-  check('impossible date rejected', (await api('POST', '/api/medicines', { token: admin, body: badDate })).status === 400);
-  check('already-expired stock rejected', (await api('POST', '/api/medicines', { token: admin, body: { ...badDate, expiry: '2020-01-01' } })).status === 400);
-  const created = await api('POST', '/api/medicines', { token: admin, body: { ...badDate, expiry: '2035-01-01', barcode: 'BC-1' } });
+
+  const base = { name: 'Test', category: 'X', price: 5, stock: 1 };
+  check('impossible date rejected', (await api('POST', '/api/medicines', { token: admin, body: { ...base, expiry: '2030-02-31' } })).status === 400);
+  check('already-expired stock rejected', (await api('POST', '/api/medicines', { token: admin, body: { ...base, expiry: '2020-01-01' } })).status === 400);
+  const created = await api('POST', '/api/medicines', { token: admin, body: { ...base, expiry: '2035-01-01', barcode: 'BC-1' } });
   check('create medicine', created.status === 201);
-  check('duplicate barcode -> 409', (await api('POST', '/api/medicines', { token: admin, body: { ...badDate, name: 'Test2', expiry: '2035-01-01', barcode: 'BC-1' } })).status === 409);
+  check('duplicate barcode -> 409', (await api('POST', '/api/medicines', { token: admin, body: { ...base, name: 'Test2', expiry: '2035-01-01', barcode: 'BC-1' } })).status === 409);
   const bc = await api('GET', '/api/medicines/barcode/BC-1', { token: admin });
   check('barcode lookup + sellable flag', bc.status === 200 && bc.data.sellable === true);
 
   console.log('Sales');
-  const sale = await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: para.id, quantity: 2, price: 0.01 }] } });
+  const qty = 2;
+  const sale = await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: para.id, quantity: qty, price: 0.01 }] } });
   check('sale created', sale.status === 201);
-  check('client price ignored (8.00 + 0.40 = 8.40)', sale.data.sale.subtotal === 8 && sale.data.sale.tax === 0.4 && sale.data.sale.total === 8.4);
-  const after = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === para.id);
-  check('stock deducted', after.stock === para.stock - 2);
-  check('oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: 9 }] } })).status === 400);
-  check('split-line oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: 5 }, { medicineId: ibu.id, quantity: 5 }] } })).status === 400);
-  const ibuAfter = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === ibu.id);
+  const subtotal = money(para.price * qty);
+  const tax = money(subtotal * TAX_RATE);
+  check(
+    `client price ignored (${subtotal.toFixed(2)} + ${tax.toFixed(2)} = ${money(subtotal + tax).toFixed(2)})`,
+    sale.data?.sale?.subtotal === subtotal && sale.data.sale.tax === tax && sale.data.sale.total === money(subtotal + tax),
+    JSON.stringify(sale.data?.sale)
+  );
+  const saleId = sale.data.sale.saleId;
+
+  const after = (await listMeds(admin)).find((m) => m.id === para.id);
+  check('stock deducted', after.stock === para.stock - qty);
+
+  // Derive quantities from real stock instead of hard-coding magic numbers
+  check('oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: ibu.stock + 1 }] } })).status === 400);
+  const half = Math.floor(ibu.stock / 2) + 1; // two lines that together exceed stock
+  check('split-line oversell blocked', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: ibu.id, quantity: half }, { medicineId: ibu.id, quantity: half }] } })).status === 400);
+  const ibuAfter = (await listMeds(admin)).find((m) => m.id === ibu.id);
   check('failed sales left stock untouched', ibuAfter.stock === ibu.stock);
-  const rcpt = await api('GET', `/api/sales/${sale.data.sale.saleId}/receipt`, { token: admin });
-  check('receipt is a PDF', rcpt.type.includes('application/pdf') && rcpt.data.slice(0, 4).toString() === '%PDF');
+
+  const rcpt = await api('GET', `/api/sales/${saleId}/receipt`, { token: admin });
+  check('receipt is a PDF', rcpt.type.includes('application/pdf') && rcpt.data.subarray(0, 4).toString() === '%PDF');
 
   console.log('Void & expiry');
-  check('void sale', (await api('POST', `/api/sales/${sale.data.sale.saleId}/void`, { token: admin, body: { reason: 'Customer returned' } })).status === 200);
-  const restored = (await api('GET', '/api/medicines', { token: admin })).data.find(m => m.id === para.id);
+  check('void sale', (await api('POST', `/api/sales/${saleId}/void`, { token: admin, body: { reason: 'Customer returned' } })).status === 200);
+  const restored = (await listMeds(admin)).find((m) => m.id === para.id);
   check('stock restored after void', restored.stock === para.stock);
-  check('double void -> 409', (await api('POST', `/api/sales/${sale.data.sale.saleId}/void`, { token: admin, body: { reason: 'Again please' } })).status === 409);
-  await api('PUT', `/api/medicines/${created.data.id}`, { token: admin, body: { ...badDate, expiry: '2020-01-01', barcode: 'BC-1' } });
+  check('double void -> 409', (await api('POST', `/api/sales/${saleId}/void`, { token: admin, body: { reason: 'Again please' } })).status === 409);
+
+  const expire = await api('PUT', `/api/medicines/${created.data.id}`, { token: admin, body: { ...base, expiry: '2020-01-01', barcode: 'BC-1' } });
+  check('can mark existing item expired (setup)', expire.status === 200, `(got ${expire.status})`);
   check('expired item cannot be sold', (await api('POST', '/api/sales', { token: admin, body: { items: [{ medicineId: created.data.id, quantity: 1 }] } })).status === 400);
-  check('restock adds relative stock', (await api('POST', `/api/medicines/${para.id}/restock`, { token: admin, body: { quantity: 10 } })).data.stock === para.stock + 10);
+  const restock = await api('POST', `/api/medicines/${para.id}/restock`, { token: admin, body: { quantity: 10 } });
+  check('restock adds relative stock', restock.data?.stock === para.stock + 10);
 
   console.log('Roles & sessions');
   check('create pharmacist', (await api('POST', '/api/users', { token: admin, body: { username: 'Amina', password: 'Pharma#Pass1' } })).status === 201);
-  const ph = (await api('POST', '/api/auth/login', { body: { username: 'amina', password: 'Pharma#Pass1' } })).data.token;
+  const ph = (await login('amina', 'Pharma#Pass1')).data?.token;
   check('pharmacist login (case-insensitive username)', !!ph);
-  check('pharmacist cannot add medicine -> 403', (await api('POST', '/api/medicines', { token: ph, body: { ...badDate, expiry: '2035-01-01' } })).status === 403);
+  check('pharmacist cannot add medicine -> 403', (await api('POST', '/api/medicines', { token: ph, body: { ...base, expiry: '2035-01-01' } })).status === 403);
   check('pharmacist can sell', (await api('POST', '/api/sales', { token: ph, body: { items: [{ medicineId: para.id, quantity: 1 }] } })).status === 201);
+
   const cp = await api('POST', '/api/auth/change-password', { token: ph, body: { currentPassword: 'Pharma#Pass1', newPassword: 'NewPharma#Pass2' } });
-  check('change password', cp.status === 200 && !!cp.data.token);
+  check('change password', cp.status === 200 && !!cp.data?.token);
   check('old token revoked after password change', (await api('GET', '/api/medicines', { token: ph })).status === 401);
   check('new token works', (await api('GET', '/api/medicines', { token: cp.data.token })).status === 200);
-  const adminId = (await api('GET', '/api/users', { token: admin })).data.find(u => u.username === 'admin').id;
+
+  const users = (await api('GET', '/api/users', { token: admin })).data;
+  const adminId = users.find((u) => u.username === 'admin').id;
   check('cannot delete self', (await api('DELETE', `/api/users/${adminId}`, { token: admin })).status === 400);
-  check('dashboard stats', (await api('GET', '/api/dashboard/stats', { token: admin })).data.success === true);
-  check('audit log readable by admin only', (await api('GET', '/api/audit-logs', { token: admin })).status === 200 && (await api('GET', '/api/audit-logs', { token: cp.data.token })).status === 403);
+  check('dashboard stats', (await api('GET', '/api/dashboard/stats', { token: admin })).data?.success === true);
+
+  const auditAdmin = await api('GET', '/api/audit-logs', { token: admin });
+  const auditPharm = await api('GET', '/api/audit-logs', { token: cp.data.token });
+  check('audit log readable by admin', auditAdmin.status === 200);
+  check('audit log forbidden for pharmacist', auditPharm.status === 403);
   check('unknown route -> 404 JSON', (await api('GET', '/api/nope', { token: admin })).status === 404);
 
   console.log('Brute-force protection');
   let last;
-  for (let i = 0; i < 6; i++) last = await api('POST', '/api/auth/login', { body: { username: 'locktest', password: 'badbadbad' } });
-  check('account locked after repeated failures (429)', last.status === 429);
+  for (let i = 0; i < 6; i++) last = await login('locktest', 'badbadbad');
+  check('account locked after repeated failures (429)', last.status === 429, `(got ${last.status})`);
+}
+
+async function waitForServer(server, timeoutMs = 10_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (server.exitCode !== null) throw new Error(`Server exited early with code ${server.exitCode}`);
+    try { if ((await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(1000) })).ok) return; } catch { /* not up yet */ }
+    await sleep(200);
+  }
+  throw new Error('Server did not become healthy in time');
 }
 
 (async () => {
@@ -101,41 +152,22 @@ async function run() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';
-  server.stdout.on('data', d => (log += d));
-  server.stderr.on('data', d => (log += d));
+  server.stdout.on('data', (d) => (log += d));
+  server.stderr.on('data', (d) => (log += d));
+
   try {
-    for (let i = 0; i < 50; i++) { // wait for startup
-      try { if ((await fetch(`${BASE}/api/health`)).ok) break; } catch {}
-      await new Promise(r => setTimeout(r, 200));
-    }
+    await waitForServer(server);
     await run();
   } catch (e) {
-    failed++; console.log('  ERROR', e.stack || e);
+    failed++;
+    console.log('  ERROR', e.stack || e);
   } finally {
     server.kill('SIGTERM');
-    await new Promise(r => setTimeout(r, 500));
+    await sleep(500);
     for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) fs.rmSync(f, { force: true });
   }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed) console.log('\nServer log:\n' + log);
-  process.exit(failed ? 1 : 0);
+  process.exitCode = failed ? 1 : 0;
 })();
-// login: use the real route
-request('/auth/login', { method: 'POST', body: { username: username.trim().toLowerCase(), password }, auth: false })
-
-// search: server expects ?q=
-if (term) params.set('q', term);
-
-// restock: server expects POST
-request(`/medicines/${id}/restock`, { method: 'POST', body: { quantity: qty } })
-
-// checkout: server expects medicineId (camelCase)
-const items = [...merged].map(([medicineId, quantity]) => ({ medicineId, quantity }));
-// ...and read item?.medicineId in the loop above it
-
-// void: server requires a reason
-function voidSale(saleId, reason) {
-  const id = toPositiveInt(saleId, 'Sale ID');
-  if (typeof reason !== 'string' || reason.trim().length < 3) throw new ApiError('Enter a reason (3+ characters)', 400);
-  return once(`void:${id}`, () => request(`/sales/${id}/void`, { method: 'POST', body: { reason: reason.trim() } }));
-}
