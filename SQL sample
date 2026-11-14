@@ -56,7 +56,6 @@ CREATE INDEX idx_sale_items_sale ON sale_items(sale_id);
 CREATE TABLE stock_movements (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   medicine_id INTEGER NOT NULL REFERENCES medicines(id) ON DELETE CASCADE,
-  delta       INTEGER NOT NULL CHECK (delta <> 0),
   reason      TEXT NOT NULL CHECK (reason IN ('sale','void','restock','adjust')),
   ref_id      INTEGER,
   user_id     INTEGER REFERENCES users(id),
