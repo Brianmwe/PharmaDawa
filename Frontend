@@ -819,3 +819,59 @@ app.post('/api/auth/logout', async (req, res) => {
   if (row) await db.refresh.revokeFamily(row.family);
   res.clearCookie('pd_refresh', { path: '/api/auth' }).json({ ok: true });
 });
+// Drop these into your frontend API module (where `request`, `once`, `ApiError`
+// and `toPositiveInt` already exist). They are NOT part of the test file.
+
+// --- login: real route, normalised username (never trim the password) ---
+function login(username, password) {
+  if (typeof username !== 'string' || !username.trim() || typeof password !== 'string' || !password) {
+    throw new ApiError('Enter username and password', 400);
+  }
+  return request('/auth/login', {
+    method: 'POST',
+    body: { username: username.trim().toLowerCase(), password },
+    auth: false,
+  });
+}
+
+// --- search: server expects ?q= ---
+function searchMedicines(term) {
+  const params = new URLSearchParams();
+  const q = typeof term === 'string' ? term.trim() : '';
+  if (q) params.set('q', q);
+  const qs = params.toString();
+  return request(`/medicines${qs ? `?${qs}` : ''}`);
+}
+
+// --- restock: POST, validated positive integer quantity ---
+function restock(id, qty) {
+  const medId = toPositiveInt(id, 'Medicine ID');
+  const quantity = toPositiveInt(qty, 'Quantity');
+  return once(`restock:${medId}`, () =>
+    request(`/medicines/${medId}/restock`, { method: 'POST', body: { quantity } })
+  );
+}
+
+// --- checkout: server expects camelCase medicineId; never send price (server ignores it) ---
+function checkout(cartItems) {
+  const merged = new Map(); // merge duplicate lines
+  for (const item of cartItems) {
+    const medicineId = toPositiveInt(item?.medicineId, 'Medicine ID');
+    const quantity = toPositiveInt(item?.quantity, 'Quantity');
+    merged.set(medicineId, (merged.get(medicineId) || 0) + quantity);
+  }
+  if (merged.size === 0) throw new ApiError('Cart is empty', 400);
+  const items = [...merged].map(([medicineId, quantity]) => ({ medicineId, quantity }));
+  return once('checkout', () => request('/sales', { method: 'POST', body: { items } }));
+}
+
+// --- void: server requires a reason (3+ chars) ---
+function voidSale(saleId, reason) {
+  const id = toPositiveInt(saleId, 'Sale ID');
+  if (typeof reason !== 'string' || reason.trim().length < 3) {
+    throw new ApiError('Enter a reason (3+ characters)', 400);
+  }
+  return once(`void:${id}`, () =>
+    request(`/sales/${id}/void`, { method: 'POST', body: { reason: reason.trim() } })
+  );
+}
