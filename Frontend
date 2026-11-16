@@ -875,3 +875,18 @@ function voidSale(saleId, reason) {
     request(`/sales/${id}/void`, { method: 'POST', body: { reason: reason.trim() } })
   );
 }
+try {
+  res = await fetch(/* ... */);
+  if (res.ok && raw) return res;
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) { /* 401 handling, throw ApiError */ }
+  return data;
+} catch (e) {
+  if (e instanceof ApiError) throw e;
+  throw new ApiError(0, e.name === 'AbortError'
+    ? 'The server took too long to respond.'
+    : 'Cannot reach the server. Check your connection.');
+} finally {
+  clearTimeout(timer);
+}
