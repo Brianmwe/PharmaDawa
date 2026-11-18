@@ -1,751 +1,652 @@
 'use strict';
-// PharmaDawa frontend. Zero dependencies, zero innerHTML, zero inline handlers:
-// every piece of dynamic text is inserted as a text node, so injected markup can never execute.
-// NOTE: client-side checks are UX only. The server must re-validate stock, expiry, prices, tax and roles.
-(() => {
-  // ---------------------------------------------------------------- config
-  const API_BASE = (document.querySelector('meta[name="api-base"]')?.content || '/api').replace(/\/+$/, '');
-  const IDLE_MS = 15 * 60 * 1000;      // auto sign-out on shared counters
-  const REQUEST_TIMEOUT_MS = 15000;
-  const REFRESH_STALE_MS = 30000;      // refetch stock when a hidden tab becomes visible after this long
-  const MAX_LINE_QTY = 1000;           // matches the server limit
-  const RENDER_CAP = 120;              // max cards/rows drawn at once
-  const TOKEN_KEY = 'pd_token';
+// PharmaDawa server: REST API + static frontend, no npm dependencies.
+// Needs Node 22.13+ (built-in node:sqlite). Configuration comes from environment variables (see .env.example).
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { promisify } = require('node:util');
+const { DatabaseSync } = require('node:sqlite');
 
-  const VIEW = Object.freeze({ POS: 'pos', INVENTORY: 'inventory', SALES: 'sales', USERS: 'users' });
-  const STATUS = Object.freeze({ OK: 'ok', LOW: 'low', OUT: 'out', EXPIRING: 'expiring', EXPIRED: 'expired' });
-  const TITLES = {
-    [VIEW.POS]: 'Point of sale',
-    [VIEW.INVENTORY]: 'Inventory',
-    [VIEW.SALES]: 'Sales history',
-    [VIEW.USERS]: 'Staff accounts',
-  };
+const scrypt = promisify(crypto.scrypt);
+const env = process.env;
 
-  const state = {
-    token: null,
-    user: null,
-    cfg: { currency: 'KES', taxRate: 0.05, lowStockThreshold: 10, expiryWarnDays: 60 },
-    medicines: [],
-    view: VIEW.POS,
-    checkingOut: false,
-  };
-  const cart = new Map();              // medicineId -> quantity (prices always come from the server)
-  let checkoutKey = null;              // idempotency key for the current cart
-  let redraw = null;                   // repaint function of the active view
-  let idleTimer = null;
-  let lastRefresh = 0;
+// ---------------------------------------------------------------- config
+const CFG = {
+  port: Number(env.PORT) || 3000,
+  host: env.HOST || '127.0.0.1',
+  dbPath: env.DB_PATH || path.join(__dirname, 'data', 'pharmadawa.db'),
+  jwtSecret: env.JWT_SECRET || '',
+  tokenTtlMs: (Number(env.TOKEN_TTL_HOURS) || 12) * 3600 * 1000,
+  currency: env.CURRENCY || 'KES',
+  taxRate: env.TAX_RATE !== undefined ? Number(env.TAX_RATE) : 0.05,
+  lowStockThreshold: Number(env.LOW_STOCK_THRESHOLD) || 10,
+  expiryWarnDays: Number(env.EXPIRY_WARN_DAYS) || 60,
+  pharmacyName: env.PHARMACY_NAME || 'PharmaDawa Pharmacy',
+  trustProxy: env.TRUST_PROXY === 'true',
+  seedDemo: env.SEED_DEMO !== undefined ? env.SEED_DEMO === 'true' : env.NODE_ENV !== 'production',
+};
+const MAX_LINE_QTY = 1000;
+const MAX_STOCK = 1_000_000;
 
-  const root = document.getElementById('app');
-  const $ = (sel, scope = document) => scope.querySelector(sel);
+function fatal(msg) { console.error(`Config error: ${msg}`); process.exit(1); }
+if (CFG.jwtSecret.length < 32) fatal('JWT_SECRET must be a random string of at least 32 characters (run: openssl rand -hex 32).');
+if (!Number.isFinite(CFG.taxRate) || CFG.taxRate < 0 || CFG.taxRate > 1) fatal('TAX_RATE must be between 0 and 1 (0.05 = 5%).');
 
-  // ---------------------------------------------------------------- helpers
-  const store = {
-    get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-    set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage unavailable */ } },
-    del(k) { try { sessionStorage.removeItem(k); } catch { /* ignore */ } },
-  };
-  const pad = (n) => String(n).padStart(2, '0');
-  const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return localDate(d); };
-  // "today" and the expiry-warning cutoff, computed once per render instead of once per medicine
-  const dateCtx = () => ({ today: localDate(), soon: addDays(state.cfg.expiryWarnDays) });
-  const daysBetween = (from, to) => Math.round((Date.parse(`${to}T00:00:00`) - Date.parse(`${from}T00:00:00`)) / 864e5);
+// ---------------------------------------------------------------- small helpers
+class HttpError extends Error {
+  constructor(status, message, details) { super(message); this.status = status; this.details = details; }
+}
+const pad = (n) => String(n).padStart(2, '0');
+const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return localDate(d); };
+const stamp = (iso) => { const d = new Date(iso); return `${localDate(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const nowIso = () => new Date().toISOString();
+const isInt = (v, min, max) => Number.isInteger(v) && v >= min && v <= max;
+const clampInt = (v, min, max, dflt) => { const n = Number.parseInt(v, 10); return Number.isInteger(n) ? Math.min(Math.max(n, min), max) : dflt; };
 
-  const cents = (n) => Math.round(Number(n) * 100);
-  const money = (n) => `${state.cfg.currency} ${Number(n).toFixed(2)}`;
-  const moneyC = (c) => money(c / 100);
-  const medById = (id) => state.medicines.find((m) => m.id === id);
-  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
-  const repaint = () => { if (redraw) redraw(); };
-  const resetCart = () => { cart.clear(); checkoutKey = null; };
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+function parseId(s) {
+  if (!/^\d{1,9}$/.test(s) || Number(s) < 1) throw new HttpError(400, 'Invalid ID.');
+  return Number(s);
+}
+function validDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
 
-  // Random 128-bit hex key. crypto.randomUUID() needs HTTPS; getRandomValues works everywhere.
-  const randomKey = () => {
-    const b = new Uint8Array(16); crypto.getRandomValues(b);
-    return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-  };
-  const formatErr = (e) => {
-    const base = (e && e.message) || 'Something went wrong.';
-    return e && Array.isArray(e.details) && e.details.length ? `${base}: ${e.details.join('; ')}` : base;
-  };
-  const formatDateTime = (v) => { const d = new Date(v); return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(); };
+// ---------------------------------------------------------------- database
+fs.mkdirSync(path.dirname(CFG.dbPath), { recursive: true });
+const db = new DatabaseSync(CFG.dbPath);
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA foreign_keys = ON;
+  PRAGMA busy_timeout = 5000;
 
-  // Safe DOM builder: strings become text nodes. There is deliberately no way to pass raw HTML.
-  function append(node, kids) {
-    for (const k of kids.flat(Infinity)) {
-      if (k === null || k === undefined || k === false) continue;
-      node.append(k instanceof Node ? k : document.createTextNode(String(k)));
-    }
-  }
-  function h(tag, attrs, ...kids) {
-    const n = document.createElement(tag);
-    let value;
-    if (attrs) {
-      for (const [k, v] of Object.entries(attrs)) {
-        if (v === null || v === undefined || v === false) continue;
-        if (k === 'value') value = v;
-        else if (k === 'class') n.className = v;
-        else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
-        else n.setAttribute(k, v === true ? '' : String(v));
-      }
-    }
-    append(n, kids);
-    if (value !== undefined) n.value = value; // after children so <select> options exist
-    return n;
-  }
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin', 'pharmacist')),
+    token_version INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS medicines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    price_c INTEGER NOT NULL CHECK (price_c >= 0),
+    stock INTEGER NOT NULL CHECK (stock >= 0),
+    expiry TEXT NOT NULL,
+    barcode TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_medicines_barcode ON medicines(barcode) WHERE barcode IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    subtotal_c INTEGER NOT NULL,
+    tax_c INTEGER NOT NULL,
+    total_c INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    voided_at TEXT,
+    void_reason TEXT,
+    voided_by INTEGER REFERENCES users(id),
+    idem_key TEXT
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_idem ON sales(user_id, idem_key) WHERE idem_key IS NOT NULL;
+  CREATE TABLE IF NOT EXISTS sale_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+    medicine_id INTEGER NOT NULL REFERENCES medicines(id),
+    name TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price_c INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    action TEXT NOT NULL,
+    detail TEXT,
+    ip TEXT,
+    created_at TEXT NOT NULL
+  );
+`);
 
-  function toast(msg, type = 'info') {
-    let box = $('#toasts');
-    if (!box) { box = h('div', { id: 'toasts', 'aria-live': 'polite' }); document.body.append(box); }
-    const t = h('div', { class: `toast ${type}`, role: type === 'error' ? 'alert' : 'status' }, msg);
-    box.append(t);
-    setTimeout(() => t.remove(), type === 'error' ? 7000 : 3500);
-  }
+const stmtCache = new Map();
+const prep = (sql) => { let s = stmtCache.get(sql); if (!s) { s = db.prepare(sql); stmtCache.set(sql, s); } return s; };
+const get = (sql, ...p) => prep(sql).get(...p);
+const all = (sql, ...p) => prep(sql).all(...p);
+const run = (sql, ...p) => prep(sql).run(...p);
+function tx(fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = fn(); db.exec('COMMIT'); return r; }
+  catch (e) { try { db.exec('ROLLBACK'); } catch { /* already rolled back */ } throw e; }
+}
+const isUniqueErr = (e) => /UNIQUE constraint failed/i.test(String(e && e.message));
 
-  const statusBadge = (st) => (st.key === STATUS.OK ? null : h('span', { class: `badge ${st.cls}` }, st.label));
-  const simpleTable = (headers, rows) =>
-    h('div', { class: 'table-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, headers.map((t) => h('th', { scope: 'col' }, t)))),
-      h('tbody', null, rows)));
+function audit(user, action, detail, ip) {
+  try { run('INSERT INTO audit_logs (user_id, username, action, detail, ip, created_at) VALUES (?, ?, ?, ?, ?, ?)', user ? user.id : null, user ? user.username : null, action, detail ?? null, ip ?? null, nowIso()); }
+  catch (e) { console.error('audit failed:', e.message); }
+}
 
-  // Loads data, shows "Loading…" / the error, and hands build() a reload function.
-  function loadedView(load, build) {
-    const box = h('div');
-    const run = async () => {
-      box.replaceChildren(h('p', { class: 'note' }, 'Loading…'));
-      try { box.replaceChildren(build(await load(), run)); }
-      catch (e) {
-        box.replaceChildren(
-          h('p', { class: 'form-error', role: 'alert' }, formatErr(e)),
-          h('button', { class: 'btn small', type: 'button', onclick: run }, 'Try again'));
-      }
-    };
-    run();
-    return box;
-  }
+// ---------------------------------------------------------------- passwords & tokens
+async function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(pw, salt, 64);
+  return `scrypt$${salt.toString('base64')}$${key.toString('base64')}`;
+}
+async function verifyPassword(pw, stored) {
+  const [alg, s, k] = String(stored).split('$');
+  if (alg !== 'scrypt' || !s || !k) return false;
+  const key = await scrypt(pw, Buffer.from(s, 'base64'), 64);
+  const expected = Buffer.from(k, 'base64');
+  return key.length === expected.length && crypto.timingSafeEqual(key, expected);
+}
+let dummyHash;
+const getDummyHash = async () => (dummyHash ??= await hashPassword(crypto.randomBytes(12).toString('hex')));
 
-  // ---------------------------------------------------------------- API
-  class ApiError extends Error {
-    constructor(status, message, details) { super(message); this.status = status; this.details = details; }
-  }
+const b64u = (v) => Buffer.from(v).toString('base64url');
+const hmac = (data) => crypto.createHmac('sha256', CFG.jwtSecret).update(data).digest('base64url');
+function signToken(u) {
+  const head = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64u(JSON.stringify({ sub: u.id, tv: u.token_version, exp: Date.now() + CFG.tokenTtlMs }));
+  return `${head}.${body}.${hmac(`${head}.${body}`)}`;
+}
+function verifyToken(token) {
+  const parts = String(token).split('.');
+  if (parts.length !== 3) return null;
+  const given = Buffer.from(parts[2]);
+  const expected = Buffer.from(hmac(`${parts[0]}.${parts[1]}`));
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return p && p.exp > Date.now() ? p : null;
+  } catch { return null; }
+}
+function authenticate(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+  const p = m && verifyToken(m[1]);
+  const u = p && get('SELECT id, username, role, token_version, active FROM users WHERE id = ?', p.sub);
+  if (!u || !u.active || u.token_version !== p.tv) throw new HttpError(401, 'Your session has ended. Please sign in again.');
+  return u;
+}
+const userOut = (u) => ({ id: u.id, username: u.username, role: u.role });
 
-  async function api(path, { method = 'GET', body, auth = true, raw = false, soft401 = false, headers = {} } = {}) {
-    const ctrl = new AbortController();
-    // The timer stays armed until the body has been read, so a stalled response can't hang forever.
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    const hdrs = { ...headers };
-    if (body !== undefined) hdrs['Content-Type'] = 'application/json';
-    if (auth && state.token) hdrs.Authorization = `Bearer ${state.token}`;
-    try {
-      const res = await fetch(API_BASE + path, {
-        method, headers: hdrs, cache: 'no-store', signal: ctrl.signal,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-      });
-      if (res.ok && raw) return await res.blob();
-      let data = null;
-      try { data = await res.json(); } catch { /* non-JSON body */ }
-      if (!res.ok) {
-        if (res.status === 401 && auth && !soft401 && state.token) logout('Your session has ended. Please sign in again.');
-        throw new ApiError(res.status, (data && data.error) || `Request failed (${res.status}).`, data && data.details);
-      }
-      return data;
-    } catch (e) {
-      if (e instanceof ApiError) throw e;
-      throw new ApiError(0, e.name === 'AbortError'
-        ? 'The server took too long to respond.'
-        : 'Cannot reach the server. Check your connection.');
-    } finally {
-      clearTimeout(timer);
-    }
-  }
+// ---------------------------------------------------------------- brute-force protection
+const MAX_FAILS = 5;
+const LOCK_WINDOW_MS = 15 * 60 * 1000;
+const attempts = new Map(); // "ip|username" -> { n, reset }
+function lockedFor(key) {
+  const a = attempts.get(key);
+  if (!a) return 0;
+  if (Date.now() > a.reset) { attempts.delete(key); return 0; }
+  return a.n >= MAX_FAILS ? a.reset - Date.now() : 0;
+}
+function recordFail(key) {
+  const a = attempts.get(key);
+  if (!a || Date.now() > a.reset) {
+    if (attempts.size > 10000) attempts.delete(attempts.keys().next().value);
+    attempts.set(key, { n: 1, reset: Date.now() + LOCK_WINDOW_MS });
+  } else a.n++;
+}
+setInterval(() => { const t = Date.now(); for (const [k, a] of attempts) if (t > a.reset) attempts.delete(k); }, 60_000).unref();
 
-  // ---------------------------------------------------------------- session
-  function bumpIdle() {
-    if (!state.token) return;
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => logout('Signed out after 15 minutes of inactivity.'), IDLE_MS);
-  }
-  ['click', 'keydown', 'pointerdown', 'touchstart'].forEach((ev) => document.addEventListener(ev, bumpIdle, { passive: true }));
+// ---------------------------------------------------------------- router
+const routes = [];
+function route(method, pattern, opts, handler) {
+  if (typeof opts === 'function') { handler = opts; opts = {}; }
+  const keys = [];
+  const re = new RegExp(`^${pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; })}$`);
+  routes.push({ method, re, keys, opts, handler });
+}
+const ADMIN = { roles: ['admin'] };
+const PUBLIC = { public: true };
+const raw = (body, headers) => ({ __raw: true, body, headers });
 
-  function logout(message) {
-    state.token = null; state.user = null; state.medicines = [];
-    resetCart(); redraw = null;
-    store.del(TOKEN_KEY);
-    clearTimeout(idleTimer);
-    document.querySelectorAll('dialog').forEach((d) => d.close());
-    renderLogin(message);
-  }
-
-  async function fetchMedicines() {
-    state.medicines = await api('/medicines?limit=5000');
-    lastRefresh = Date.now();
-  }
-
-  async function loadSession() {
-    const cfg = await api('/config');
-    state.user = cfg.user;
-    state.cfg = { currency: cfg.currency, taxRate: cfg.taxRate, lowStockThreshold: cfg.lowStockThreshold, expiryWarnDays: cfg.expiryWarnDays };
-    await fetchMedicines();
-  }
-
-  async function refreshMedicines() {
-    await fetchMedicines();
-    pruneCart();
-    updateHeader();
-    repaint();
-  }
-
-  // ---------------------------------------------------------------- medicine status
-  function statusOf(m, { today, soon } = dateCtx()) {
-    if (m.expiry < today) return { key: STATUS.EXPIRED, label: 'Expired', cls: 'bad' };
-    if (m.stock <= 0) return { key: STATUS.OUT, label: 'Out of stock', cls: 'bad' };
-    if (m.stock <= state.cfg.lowStockThreshold) return { key: STATUS.LOW, label: 'Running low', cls: 'warn' };
-    if (m.expiry <= soon) return { key: STATUS.EXPIRING, label: 'Expires soon', cls: 'warn' };
-    return { key: STATUS.OK, label: 'In stock', cls: 'ok' };
-  }
-  const isSellable = (m, today = localDate()) => m.stock > 0 && m.expiry >= today;
-
-  function expiryText(m, today = localDate()) {
-    const d = daysBetween(today, m.expiry);
-    if (Number.isNaN(d)) return m.expiry;
-    if (d < 0) return `Expired ${plural(-d, 'day')} ago`;
-    if (d === 0) return 'Expires today';
-    if (d <= state.cfg.expiryWarnDays) return `Expires in ${plural(d, 'day')}`;
-    return `Expires ${m.expiry}`;
-  }
-
-  function matchesFilter(m, f, { today, soon } = dateCtx()) {
-    if (f === 'all') return true;
-    if (f === STATUS.EXPIRED) return m.expiry < today;
-    if (m.expiry < today) return false;
-    if (f === STATUS.LOW) return m.stock <= state.cfg.lowStockThreshold;
-    if (f === STATUS.EXPIRING) return m.expiry <= soon;
-    return true;
-  }
-  const matchesQuery = (m, q) =>
-    !q || m.name.toLowerCase().includes(q) || m.category.toLowerCase().includes(q) || (m.barcode && m.barcode.toLowerCase() === q);
-
-  function updateHeader() {
-    const box = $('#alerts');
-    if (!box) return;
-    const { today, soon } = dateCtx();
-    let low = 0, exp = 0, expired = 0;
-    for (const m of state.medicines) {
-      if (m.expiry < today) { if (m.stock > 0) expired++; continue; }
-      if (m.stock <= state.cfg.lowStockThreshold) low++;
-      if (m.expiry <= soon) exp++;
-    }
-    box.replaceChildren(
-      expired ? h('span', { class: 'badge bad' }, `${expired} expired in stock`) : null,
-      exp ? h('span', { class: 'badge warn' }, `${exp} expiring soon`) : null,
-      low ? h('span', { class: 'badge warn' }, `${low} running low`) : null,
-    );
-  }
-
-  // ---------------------------------------------------------------- dialogs
-  function modal(title, content) {
-    const dlg = h('dialog', { class: 'modal', 'aria-label': title }, h('h2', null, title), content);
-    dlg.addEventListener('close', () => dlg.remove());
-    document.body.append(dlg);
-    dlg.showModal();
-    return dlg;
-  }
-
-  // Generic form dialog. onSubmit may throw; its message is shown inside the dialog and the dialog stays open.
-  function openForm({ title, intro, fields = [], submitLabel = 'Save', danger = false, onSubmit }) {
-    const err = h('p', { class: 'form-error', role: 'alert' });
-    const inputs = {};
-    const rows = fields.map((f) => {
-      const common = { name: f.name, id: `f-${f.name}`, required: f.required !== false, autocomplete: f.autocomplete || 'off' };
-      const input = f.type === 'select'
-        ? h('select', common, f.options.map((o) => h('option', { value: o.value }, o.label)))
-        : h('input', { ...common, type: f.type || 'text', min: f.min, max: f.max, step: f.step, maxlength: f.maxlength, minlength: f.minlength, pattern: f.pattern, title: f.title });
-      if (f.value !== undefined && f.value !== null) input.value = f.value;
-      inputs[f.name] = input;
-      return h('label', { class: 'field' }, h('span', null, f.label), input, f.help ? h('small', null, f.help) : null);
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size <= 1_000_000) chunks.push(c); });
+    req.on('error', reject);
+    req.on('end', () => {
+      if (size > 1_000_000) return reject(new HttpError(413, 'Request is too large.'));
+      if (!size) return resolve({});
+      try {
+        const v = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');
+        resolve(v);
+      } catch { reject(new HttpError(400, 'Malformed JSON in request body.')); }
     });
-    const cancel = h('button', { type: 'button', class: 'btn', onclick: () => dlg.close() }, 'Cancel');
-    const submit = h('button', { type: 'submit', class: `btn ${danger ? 'danger' : 'primary'}` }, submitLabel);
-    const form = h('form', {
-      onsubmit: async (e) => {
-        e.preventDefault();
-        if (!form.reportValidity()) return;
-        err.textContent = '';
-        submit.disabled = true; cancel.disabled = true;
-        try {
-          const values = {};
-          for (const [k, el] of Object.entries(inputs)) values[k] = el.value;
-          await onSubmit(values);
-          dlg.close();
-        } catch (ex) {
-          err.textContent = formatErr(ex);
-          submit.disabled = false; cancel.disabled = false;
-        }
-      },
-    }, intro ? h('p', null, intro) : null, rows, err, h('div', { class: 'actions end' }, cancel, submit));
-    const dlg = modal(title, form);
-    const first = form.querySelector('input, select');
-    (first || submit).focus();
-    return dlg;
-  }
-
-  function changePasswordForm() {
-    openForm({
-      title: 'Change password',
-      submitLabel: 'Update password',
-      fields: [
-        { name: 'currentPassword', label: 'Current password', type: 'password', autocomplete: 'current-password', maxlength: 72 },
-        { name: 'newPassword', label: 'New password', type: 'password', autocomplete: 'new-password', minlength: 8, maxlength: 72, help: 'At least 8 characters.' },
-      ],
-      onSubmit: async (v) => {
-        const res = await api('/auth/change-password', { method: 'POST', body: { currentPassword: v.currentPassword, newPassword: v.newPassword } });
-        // The server revokes the old token when the password changes, so keep the fresh one.
-        if (res && res.token) { state.token = res.token; store.set(TOKEN_KEY, res.token); }
-        toast('Password updated.', 'success');
-      },
-    });
-  }
-
-  // ---------------------------------------------------------------- login
-  function renderLogin(message) {
-    redraw = null;
-    const err = h('p', { class: 'form-error', role: 'alert' }, message || '');
-    const user = h('input', { id: 'login-user', name: 'username', autocomplete: 'username', required: true, maxlength: 30, autocapitalize: 'none', spellcheck: 'false' });
-    const pass = h('input', { id: 'login-pass', name: 'password', type: 'password', autocomplete: 'current-password', required: true, maxlength: 72 });
-    const btn = h('button', { class: 'btn primary block', type: 'submit' }, 'Sign in');
-    const form = h('form', {
-      class: 'login-card',
-      onsubmit: async (e) => {
-        e.preventDefault();
-        const username = user.value.trim().toLowerCase();
-        if (!username || !pass.value) { err.textContent = 'Enter your username and password.'; return; }
-        err.textContent = ''; btn.disabled = true; btn.textContent = 'Signing in…';
-        try {
-          const res = await api('/auth/login', { method: 'POST', body: { username, password: pass.value }, auth: false });
-          state.token = res.token;
-          store.set(TOKEN_KEY, res.token);
-          pass.value = '';
-          await loadSession();
-          state.view = VIEW.POS;
-          renderShell();
-          bumpIdle();
-        } catch (ex) {
-          state.token = null; store.del(TOKEN_KEY);
-          err.textContent = formatErr(ex);
-          btn.disabled = false; btn.textContent = 'Sign in';
-        }
-      },
-    },
-    h('span', { class: 'logo', 'aria-hidden': 'true' }, 'Rx'),
-    h('h1', null, 'PharmaDawa'),
-    h('p', { class: 'sub' }, 'Sign in to start your shift'),
-    h('label', { class: 'field' }, h('span', null, 'Username'), user),
-    h('label', { class: 'field' }, h('span', null, 'Password'), pass),
-    err, btn);
-    root.replaceChildren(h('div', { class: 'login-wrap' }, form));
-    user.focus();
-  }
-
-  // ---------------------------------------------------------------- shell
-  function renderShell() {
-    const views = [[VIEW.POS, 'Point of sale'], [VIEW.INVENTORY, 'Inventory'], [VIEW.SALES, 'Sales']];
-    if (state.user.role === 'admin') views.push([VIEW.USERS, 'Staff']);
-
-    const nav = h('nav', { 'aria-label': 'Main' }, views.map(([key, label]) =>
-      h('button', { class: 'nav-btn', type: 'button', 'data-view': key, onclick: () => showView(key) }, label)));
-    const sidebar = h('aside', { class: 'sidebar' }, h('div', { class: 'brand' }, h('span', { class: 'logo', 'aria-hidden': 'true' }, 'Rx'), h('span', null, 'PharmaDawa')), nav);
-    const topbar = h('header', { class: 'topbar' },
-      h('h1', { id: 'page-title' }, TITLES[VIEW.POS]),
-      h('div', { class: 'top-right' },
-        h('div', { id: 'alerts', class: 'top-right' }),
-        h('span', { id: 'clock', class: 'clock' }),
-        h('span', { class: 'badge' }, `${state.user.username} (${state.user.role})`),
-        h('button', { class: 'btn small', type: 'button', onclick: changePasswordForm }, 'Change password'),
-        h('button', { class: 'btn small', type: 'button', onclick: () => logout('You have been signed out.') }, 'Sign out')));
-    root.replaceChildren(h('div', { class: 'app' }, sidebar, h('div', { class: 'main' }, topbar, h('div', { id: 'view', class: 'view' }))));
-    updateHeader();
-    tickClock();
-    showView(views.some(([k]) => k === state.view) ? state.view : VIEW.POS);
-  }
-
-  function showView(key) {
-    if (key === VIEW.USERS && state.user.role !== 'admin') key = VIEW.POS;
-    state.view = key;
-    redraw = null;
-    document.querySelectorAll('.nav-btn').forEach((b) => {
-      if (b.dataset.view === key) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
-    });
-    $('#page-title').textContent = TITLES[key];
-    document.title = `${TITLES[key]} - PharmaDawa`;
-    const builders = { [VIEW.POS]: viewPOS, [VIEW.INVENTORY]: viewInventory, [VIEW.SALES]: viewSales, [VIEW.USERS]: viewUsers };
-    $('#view').replaceChildren(builders[key]());
-  }
-
-  function tickClock() {
-    const el = $('#clock');
-    if (el) el.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-  setInterval(tickClock, 15000);
-
-  document.addEventListener('visibilitychange', () => {
-    // Stock can change on another terminal while this tab was hidden
-    if (document.visibilityState === 'visible' && state.token && Date.now() - lastRefresh > REFRESH_STALE_MS) {
-      refreshMedicines().catch(() => toast("Couldn't refresh stock. Figures may be out of date.", 'error'));
-    }
   });
+}
 
-  // ---------------------------------------------------------------- POS
-  function pruneCart() {
-    const notes = [];
-    for (const [id, qty] of [...cart]) {
-      const m = medById(id);
-      if (!m || !isSellable(m)) {
-        cart.delete(id);
-        notes.push(`${m ? m.name : 'An item'} was removed (no longer available)`);
-      } else if (qty > m.stock) {
-        cart.set(id, m.stock);
-        notes.push(`${m.name} reduced to ${m.stock} (available stock)`);
-      }
+function clientIp(req) {
+  if (CFG.trustProxy) { const f = req.headers['x-forwarded-for']; if (f) return String(f).split(',')[0].trim(); }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function sendJson(res, status, body, extra = {}) {
+  const data = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(data), 'Cache-Control': 'no-store', ...extra });
+  res.end(data);
+}
+function sendError(res, e) {
+  if (res.headersSent) return res.end();
+  if (e instanceof HttpError) return sendJson(res, e.status, { success: false, error: e.message, ...(e.details ? { details: e.details } : {}) });
+  console.error('Unhandled error:', e);
+  sendJson(res, 500, { success: false, error: 'Something went wrong on the server. Please try again.' });
+}
+
+async function handleApi(req, res, url) {
+  const method = req.method === 'HEAD' ? 'GET' : req.method;
+  let hit = null;
+  for (const r of routes) {
+    if (r.method !== method) continue;
+    const m = r.re.exec(url.pathname);
+    if (m) { hit = { r, m }; break; }
+  }
+  if (!hit) throw new HttpError(404, 'Not found.');
+  const params = {};
+  hit.r.keys.forEach((k, i) => { try { params[k] = decodeURIComponent(hit.m[i + 1]); } catch { throw new HttpError(400, 'Bad request.'); } });
+  const ctx = { req, res, params, query: url.searchParams, ip: clientIp(req), user: null, body: {}, status: 200 };
+  if (!hit.r.opts.public) {
+    ctx.user = authenticate(req);
+    if (hit.r.opts.roles && !hit.r.opts.roles.includes(ctx.user.role)) throw new HttpError(403, "You don't have permission to do that.");
+  }
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) ctx.body = await readJson(req);
+  const out = await hit.r.handler(ctx);
+  if (out && out.__raw) { res.writeHead(ctx.status, { 'Cache-Control': 'no-store', 'Content-Length': out.body.length, ...out.headers }); return res.end(out.body); }
+  sendJson(res, ctx.status, out);
+}
+
+// ---------------------------------------------------------------- shapes & validation
+const medOut = (r) => ({ id: r.id, name: r.name, category: r.category, price: r.price_c / 100, stock: r.stock, expiry: r.expiry, barcode: r.barcode });
+
+function parseMedicine(b, { requireFuture }) {
+  const errs = [];
+  const name = typeof b.name === 'string' ? b.name.trim() : '';
+  const category = typeof b.category === 'string' ? b.category.trim() : '';
+  if (!name || name.length > 120) errs.push('Name is required (up to 120 characters)');
+  if (!category || category.length > 60) errs.push('Category is required (up to 60 characters)');
+  if (typeof b.price !== 'number' || !Number.isFinite(b.price) || b.price < 0 || b.price > 10_000_000) errs.push('Price must be a number of 0 or more');
+  if (!isInt(b.stock, 0, MAX_STOCK)) errs.push('Stock must be a whole number of 0 or more');
+  if (!validDate(b.expiry)) errs.push('Expiry must be a real date (YYYY-MM-DD)');
+  else if (requireFuture && b.expiry < localDate()) errs.push("Expiry date is in the past. Expired stock can't be added");
+  let barcode = null;
+  if (b.barcode !== undefined && b.barcode !== null && b.barcode !== '') {
+    barcode = typeof b.barcode === 'string' ? b.barcode.trim() : '';
+    if (!barcode || barcode.length > 64) errs.push('Barcode must be 1 to 64 characters');
+  }
+  if (errs.length) throw new HttpError(400, 'Please check the medicine details', errs);
+  return { name, category, price_c: Math.round(b.price * 100), stock: b.stock, expiry: b.expiry, barcode };
+}
+const barcodeTaken = (barcode, exceptId = 0) => barcode && get('SELECT id FROM medicines WHERE barcode = ? AND id <> ?', barcode, exceptId);
+
+function loadSale(id) {
+  const s = get('SELECT s.*, u.username AS cashier FROM sales s JOIN users u ON u.id = s.user_id WHERE s.id = ?', id);
+  if (!s) return null;
+  const items = all('SELECT medicine_id, name, quantity, unit_price_c FROM sale_items WHERE sale_id = ? ORDER BY id', id);
+  return saleOut(s, items);
+}
+function saleOut(s, items) {
+  return {
+    saleId: s.id, id: s.id, cashier: s.cashier,
+    subtotal: s.subtotal_c / 100, tax: s.tax_c / 100, total: s.total_c / 100,
+    createdAt: s.created_at, voided: Boolean(s.voided_at), status: s.voided_at ? 'voided' : 'paid',
+    voidReason: s.void_reason || null,
+    ...(items ? { items: items.map((i) => ({ medicineId: i.medicine_id, name: i.name, quantity: i.quantity, unitPrice: i.unit_price_c / 100, lineTotal: (i.unit_price_c * i.quantity) / 100 })) } : {}),
+  };
+}
+
+// ---------------------------------------------------------------- receipts (tiny hand-written PDF, no libraries)
+function buildPdf(lines) {
+  const esc = (s) => String(s).replace(/[^\x20-\x7E]/g, '?').replace(/([\\()])/g, '\\$1');
+  const lh = 11;
+  const width = 226; // ~80 mm thermal roll
+  const height = Math.max(180, 36 + lines.length * lh);
+  const content = `BT /F1 8 Tf ${lh} TL 12 ${height - 22} Td\n${lines.map((l) => `(${esc(l)}) Tj T*`).join('\n')}\nET`;
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Contents 5 0 R /Resources << /Font << /F1 4 0 R >> >> >>`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>',
+    `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`,
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = [];
+  objs.forEach((o, i) => { offsets.push(Buffer.byteLength(out)); out += `${i + 1} 0 obj\n${o}\nendobj\n`; });
+  const xref = Buffer.byteLength(out);
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n${offsets.map((o) => `${String(o).padStart(10, '0')} 00000 n \n`).join('')}`;
+  out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, 'latin1');
+}
+function receiptLines(s) {
+  const W = 38;
+  const fmt = (n) => `${CFG.currency} ${n.toFixed(2)}`;
+  const center = (t) => ' '.repeat(Math.max(0, Math.floor((W - t.length) / 2))) + t;
+  const row = (l, r) => l + ' '.repeat(Math.max(1, W - l.length - r.length)) + r;
+  const L = [center(CFG.pharmacyName), center(`Receipt #${s.saleId}`), center(stamp(s.createdAt))];
+  if (s.voided) L.push(center('*** VOIDED ***'));
+  L.push(`Cashier: ${s.cashier}`, '-'.repeat(W));
+  for (const i of s.items) {
+    L.push(i.name.length > W ? `${i.name.slice(0, W - 1)}.` : i.name);
+    L.push(row(`  ${i.quantity} x ${fmt(i.unitPrice)}`, fmt(i.lineTotal)));
+  }
+  L.push('-'.repeat(W), row('Subtotal', fmt(s.subtotal)), row(`Tax (${Math.round(CFG.taxRate * 1000) / 10}%)`, fmt(s.tax)), row('TOTAL', fmt(s.total)), '', center('Thank you. Get well soon.'));
+  return L;
+}
+
+// ---------------------------------------------------------------- routes: public & session
+route('GET', '/api/health', PUBLIC, () => { get('SELECT 1'); return { status: 'ok' }; });
+
+async function loginHandler(ctx) {
+  const username = typeof ctx.body.username === 'string' ? ctx.body.username.trim().toLowerCase() : '';
+  const password = typeof ctx.body.password === 'string' ? ctx.body.password : '';
+  if (!username || !password || username.length > 64 || password.length > 200) throw new HttpError(400, 'Enter your username and password.');
+  const key = `${ctx.ip}|${username}`;
+  const wait = lockedFor(key);
+  if (wait) {
+    ctx.res.setHeader('Retry-After', Math.ceil(wait / 1000));
+    throw new HttpError(429, `Too many failed attempts. Try again in ${Math.ceil(wait / 60000)} minute(s).`);
+  }
+  const u = get('SELECT * FROM users WHERE username = ?', username);
+  const ok = await verifyPassword(password, u ? u.password_hash : await getDummyHash()); // same work either way
+  if (!u || !u.active || !ok) {
+    recordFail(key);
+    audit(null, 'login_failed', username, ctx.ip);
+    throw new HttpError(401, 'Wrong username or password.');
+  }
+  attempts.delete(key);
+  audit(u, 'login', null, ctx.ip);
+  return { success: true, token: signToken(u), user: userOut(u) };
+}
+route('POST', '/api/auth/login', PUBLIC, loginHandler);
+route('POST', '/api/login', PUBLIC, loginHandler); // legacy alias
+
+route('GET', '/api/config', (ctx) => ({
+  success: true, user: userOut(ctx.user), currency: CFG.currency, taxRate: CFG.taxRate,
+  lowStockThreshold: CFG.lowStockThreshold, expiryWarnDays: CFG.expiryWarnDays, pharmacyName: CFG.pharmacyName,
+}));
+
+route('POST', '/api/auth/change-password', async (ctx) => {
+  const { currentPassword, newPassword } = ctx.body;
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') throw new HttpError(400, 'Enter your current and new password.');
+  if (newPassword.length < 8 || newPassword.length > 72) throw new HttpError(400, 'The new password must be 8 to 72 characters.');
+  const row = get('SELECT * FROM users WHERE id = ?', ctx.user.id);
+  // 400, not 401: the app signs people out on any 401
+  if (!(await verifyPassword(currentPassword, row.password_hash))) throw new HttpError(400, 'Your current password is incorrect.');
+  if (newPassword === currentPassword) throw new HttpError(400, 'Choose a password different from the current one.');
+  run('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?', await hashPassword(newPassword), row.id);
+  audit(ctx.user, 'password_changed', null, ctx.ip);
+  return { success: true, token: signToken(get('SELECT * FROM users WHERE id = ?', row.id)) };
+});
+
+// ---------------------------------------------------------------- routes: medicines
+route('GET', '/api/medicines', (ctx) => {
+  const term = (ctx.query.get('q') || '').trim();
+  const limit = clampInt(ctx.query.get('limit'), 1, 5000, 1000);
+  const rows = term
+    ? all("SELECT * FROM medicines WHERE name LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' OR barcode = ? ORDER BY name COLLATE NOCASE LIMIT ?",
+      `%${term.replace(/[\\%_]/g, '\\$&')}%`, `%${term.replace(/[\\%_]/g, '\\$&')}%`, term, limit)
+    : all('SELECT * FROM medicines ORDER BY name COLLATE NOCASE LIMIT ?', limit);
+  return rows.map(medOut);
+});
+
+route('GET', '/api/medicines/barcode/:code', (ctx) => {
+  const r = get('SELECT * FROM medicines WHERE barcode = ?', ctx.params.code);
+  if (!r) throw new HttpError(404, 'No medicine has that barcode.');
+  return { success: true, ...medOut(r), sellable: r.stock > 0 && r.expiry >= localDate() };
+});
+
+route('POST', '/api/medicines', ADMIN, (ctx) => {
+  const m = parseMedicine(ctx.body, { requireFuture: true });
+  if (barcodeTaken(m.barcode)) throw new HttpError(409, 'Another medicine already uses that barcode.');
+  const t = nowIso();
+  try {
+    const { lastInsertRowid } = run('INSERT INTO medicines (name, category, price_c, stock, expiry, barcode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', m.name, m.category, m.price_c, m.stock, m.expiry, m.barcode, t, t);
+    audit(ctx.user, 'medicine_created', `${m.name} (id ${lastInsertRowid})`, ctx.ip);
+    ctx.status = 201;
+    return { success: true, ...medOut(get('SELECT * FROM medicines WHERE id = ?', Number(lastInsertRowid))) };
+  } catch (e) {
+    if (isUniqueErr(e)) throw new HttpError(409, 'Another medicine already uses that barcode.');
+    throw e;
+  }
+});
+
+route('PUT', '/api/medicines/:id', ADMIN, (ctx) => {
+  const id = parseId(ctx.params.id);
+  if (!get('SELECT id FROM medicines WHERE id = ?', id)) throw new HttpError(404, 'Medicine not found.');
+  const m = parseMedicine(ctx.body, { requireFuture: false }); // editing may legitimately record an expired batch
+  if (barcodeTaken(m.barcode, id)) throw new HttpError(409, 'Another medicine already uses that barcode.');
+  try {
+    run('UPDATE medicines SET name = ?, category = ?, price_c = ?, stock = ?, expiry = ?, barcode = ?, updated_at = ? WHERE id = ?', m.name, m.category, m.price_c, m.stock, m.expiry, m.barcode, nowIso(), id);
+  } catch (e) {
+    if (isUniqueErr(e)) throw new HttpError(409, 'Another medicine already uses that barcode.');
+    throw e;
+  }
+  audit(ctx.user, 'medicine_updated', `${m.name} (id ${id})`, ctx.ip);
+  return { success: true, ...medOut(get('SELECT * FROM medicines WHERE id = ?', id)) };
+});
+
+route('POST', '/api/medicines/:id/restock', ADMIN, (ctx) => {
+  const id = parseId(ctx.params.id);
+  const qty = ctx.body.quantity;
+  if (!isInt(qty, 1, 100000)) throw new HttpError(400, 'Quantity must be a whole number between 1 and 100000.');
+  const r = get('SELECT * FROM medicines WHERE id = ?', id);
+  if (!r) throw new HttpError(404, 'Medicine not found.');
+  if (r.stock + qty > MAX_STOCK) throw new HttpError(400, `Stock can't go above ${MAX_STOCK}.`);
+  run('UPDATE medicines SET stock = stock + ?, updated_at = ? WHERE id = ?', qty, nowIso(), id);
+  audit(ctx.user, 'restock', `${r.name} +${qty}`, ctx.ip);
+  const fresh = get('SELECT * FROM medicines WHERE id = ?', id);
+  return { success: true, stock: fresh.stock, medicine: medOut(fresh) };
+});
+
+// ---------------------------------------------------------------- routes: sales
+route('POST', '/api/sales', (ctx) => {
+  const { items } = ctx.body;
+  if (!Array.isArray(items) || !items.length || items.length > 100) throw new HttpError(400, 'Add at least one item to the sale.');
+  const lines = new Map(); // merge duplicate lines so stock is checked against the total
+  for (const it of items) {
+    if (!it || !isInt(it.medicineId, 1, 2 ** 31) || !isInt(it.quantity, 1, MAX_LINE_QTY)) throw new HttpError(400, `Each item needs a valid medicine and a quantity from 1 to ${MAX_LINE_QTY}.`);
+    lines.set(it.medicineId, (lines.get(it.medicineId) || 0) + it.quantity);
+  }
+  const key = String(ctx.req.headers['idempotency-key'] || '');
+  const idem = /^[A-Za-z0-9_-]{8,64}$/.test(key) ? key : null;
+  if (idem) { // a retry of the same checkout returns the original sale instead of charging twice
+    const prev = get('SELECT id FROM sales WHERE user_id = ? AND idem_key = ?', ctx.user.id, idem);
+    if (prev) return { success: true, replayed: true, sale: loadSale(prev.id) };
+  }
+  const today = localDate();
+  const saleId = tx(() => {
+    let subtotal = 0;
+    const priced = [];
+    for (const [id, qty] of lines) {
+      const m = get('SELECT * FROM medicines WHERE id = ?', id);
+      if (!m) throw new HttpError(400, `Medicine #${id} was not found.`);
+      if (m.expiry < today) throw new HttpError(400, `${m.name} has expired and can't be sold.`);
+      if (qty > MAX_LINE_QTY) throw new HttpError(400, `You can sell at most ${MAX_LINE_QTY} of one medicine at a time.`);
+      if (m.stock < qty) throw new HttpError(400, `Only ${m.stock} of ${m.name} left in stock.`);
+      subtotal += m.price_c * qty; // always the server's price, never the client's
+      priced.push({ m, qty });
     }
-    if (notes.length) {
-      checkoutKey = null;
-      toast(notes.length === 1 ? `${notes[0]}.` : `Cart updated: ${notes.join('; ')}.`, 'error');
+    const tax = Math.round(subtotal * CFG.taxRate);
+    const { lastInsertRowid } = run('INSERT INTO sales (user_id, subtotal_c, tax_c, total_c, created_at, idem_key) VALUES (?, ?, ?, ?, ?, ?)', ctx.user.id, subtotal, tax, subtotal + tax, nowIso(), idem);
+    for (const { m, qty } of priced) {
+      run('INSERT INTO sale_items (sale_id, medicine_id, name, quantity, unit_price_c) VALUES (?, ?, ?, ?, ?)', lastInsertRowid, m.id, m.name, qty, m.price_c);
+      if (run('UPDATE medicines SET stock = stock - ?, updated_at = ? WHERE id = ? AND stock >= ?', qty, nowIso(), m.id, qty).changes !== 1) throw new HttpError(400, `Stock for ${m.name} just changed. Please try again.`);
     }
-  }
-
-  function addToCart(id) {
-    const m = medById(id);
-    if (!m || !isSellable(m)) return;
-    const q = cart.get(id) || 0;
-    if (q >= m.stock) return toast(`That's all the ${m.name} in stock.`, 'error');
-    cart.set(id, Math.min(q + 1, MAX_LINE_QTY));
-    checkoutKey = null;
-    repaint();
-  }
-  function setQty(id, q) {
-    const m = medById(id);
-    if (!m || !Number.isFinite(q) || q <= 0) cart.delete(id); else cart.set(id, Math.min(Math.floor(q), m.stock, MAX_LINE_QTY));
-    checkoutKey = null;
-    repaint();
-  }
-
-  function cartTotals() {
-    let sub = 0;
-    for (const [id, qty] of cart) { const m = medById(id); if (m) sub += cents(m.price) * qty; }
-    const tax = Math.round(sub * state.cfg.taxRate);
-    return { sub, tax, total: sub + tax };
-  }
-
-  // The server recalculates price and tax; the cart only sends ids and quantities.
-  async function checkout() {
-    if (!cart.size || state.checkingOut) return;
-    state.checkingOut = true;
-    repaint();
-    checkoutKey = checkoutKey || randomKey(); // a retry of the same cart reuses the key, so it can't double-charge
-    try {
-      const res = await api('/sales', {
-        method: 'POST',
-        headers: { 'Idempotency-Key': checkoutKey },
-        body: { items: [...cart].map(([medicineId, quantity]) => ({ medicineId, quantity })) },
-      });
-      resetCart();
-      state.checkingOut = false;
-      showSaleDone(res.sale);
-      await refreshMedicines().catch(() => toast("Sale saved, but stock couldn't refresh. Reload to update.", 'error'));
-    } catch (e) {
-      toast(formatErr(e), 'error');
-      // A 400/409 usually means stock changed under us: reload it so the cart reflects reality.
-      if (e.status === 400 || e.status === 409) { checkoutKey = null; await refreshMedicines().catch(() => {}); }
-    } finally {
-      state.checkingOut = false;
-      repaint();
-    }
-  }
-
-  async function downloadReceipt(saleId) {
-    try {
-      const blob = await api(`/sales/${saleId}/receipt`, { raw: true });
-      const url = URL.createObjectURL(blob);
-      const a = h('a', { href: url, download: `receipt-${saleId}.pdf` });
-      document.body.append(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
-    } catch (e) { toast(formatErr(e), 'error'); }
-  }
-
-  function showSaleDone(sale) {
-    const row = (label, value, cls) => h('div', { class: `sum-row ${cls || ''}` }, h('span', null, label), h('span', null, money(value)));
-    const done = h('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, 'Start next sale');
-    const dlg = modal('Sale complete', h('div', null,
-      row('Subtotal', sale.subtotal), row(`Tax`, sale.tax), row('Total', sale.total, 'total'),
-      h('div', { class: 'actions end' },
-        h('button', { class: 'btn', type: 'button', onclick: () => downloadReceipt(sale.saleId) }, 'Download receipt'),
-        done)));
-    done.focus();
-  }
-
-  function viewPOS() {
-    let q = '';
-    const grid = h('div', { class: 'cards' });
-    const cartBox = h('section', { class: 'cart', 'aria-label': 'Current sale' });
-
-    const search = h('input', {
-      type: 'search', class: 'search', 'aria-label': 'Search medicines',
-      placeholder: 'Search by name or category, or scan a barcode',
-      oninput: debounce(() => { q = search.value.trim().toLowerCase(); paintGrid(); }, 150),
-      onkeydown: (e) => {
-        if (e.key !== 'Enter') return;
-        e.preventDefault();
-        const code = search.value.trim().toLowerCase();
-        const hit = code && state.medicines.find((m) => m.barcode && m.barcode.toLowerCase() === code);
-        if (!hit) return toast('No medicine with that barcode.', 'error');
-        if (!isSellable(hit)) return toast(`${hit.name} can't be sold right now.`, 'error');
-        addToCart(hit.id);
-        search.value = ''; q = ''; paintGrid();
-      },
-    });
-
-    function paintGrid() {
-      const ctx = dateCtx();
-      const list = state.medicines.filter((m) => matchesQuery(m, q));
-      const shown = list.slice(0, RENDER_CAP);
-      const cards = shown.map((m) => {
-        const st = statusOf(m, ctx);
-        const sellable = isSellable(m, ctx.today);
-        return h('button', {
-          type: 'button', class: `card ${sellable ? '' : 'off'}`, disabled: !sellable,
-          onclick: () => addToCart(m.id),
-          'aria-label': `Add ${m.name} to sale`,
-        },
-        h('strong', null, m.name),
-        h('span', { class: 'muted' }, m.category),
-        h('span', { class: 'price' }, money(m.price)),
-        h('span', { class: 'muted' }, `${m.stock} in stock · ${expiryText(m, ctx.today)}`),
-        statusBadge(st));
-      });
-      grid.replaceChildren(
-        ...(cards.length ? cards : [h('p', { class: 'note' }, q ? `Nothing matches "${search.value.trim()}". Check the spelling or try the category.` : 'No medicines yet. An admin can add them under Inventory.')]),
-        list.length > shown.length ? h('p', { class: 'note' }, `Showing ${shown.length} of ${list.length}. Type more to narrow it down.`) : null);
-    }
-
-    function paintCart() {
-      const t = cartTotals();
-      const lines = [...cart].map(([id, qty]) => {
-        const m = medById(id);
-        if (!m) return null;
-        return h('li', { class: 'line' },
-          h('div', { class: 'line-name' }, h('strong', null, m.name), h('span', { class: 'muted' }, `${money(m.price)} each`)),
-          h('div', { class: 'qty' },
-            h('button', { type: 'button', class: 'btn small', 'aria-label': `One less ${m.name}`, onclick: () => setQty(id, qty - 1) }, '−'),
-            h('input', {
-              type: 'number', min: 1, max: Math.min(m.stock, MAX_LINE_QTY), value: qty, 'aria-label': `Quantity of ${m.name}`,
-              onchange: (e) => setQty(id, Number(e.target.value)),
-            }),
-            h('button', { type: 'button', class: 'btn small', 'aria-label': `One more ${m.name}`, onclick: () => addToCart(id) }, '+')),
-          h('span', { class: 'line-total' }, moneyC(cents(m.price) * qty)),
-          h('button', { type: 'button', class: 'btn small', 'aria-label': `Remove ${m.name}`, onclick: () => setQty(id, 0) }, 'Remove'));
-      });
-      const row = (label, c, cls) => h('div', { class: `sum-row ${cls || ''}` }, h('span', null, label), h('span', null, moneyC(c)));
-      cartBox.replaceChildren(
-        h('h2', null, 'Current sale'),
-        cart.size ? h('ul', { class: 'lines' }, lines) : h('p', { class: 'note' }, 'Nothing here yet. Tap a medicine to add it.'),
-        row('Subtotal', t.sub), row(`Tax (${Math.round(state.cfg.taxRate * 1000) / 10}%)`, t.tax), row('Total', t.total, 'total'),
-        h('p', { class: 'note small' }, 'The server confirms the final price when you charge.'),
-        h('div', { class: 'actions' },
-          h('button', { type: 'button', class: 'btn', disabled: !cart.size || state.checkingOut, onclick: () => { resetCart(); repaint(); } }, 'Clear'),
-          h('button', { type: 'button', class: 'btn primary grow', disabled: !cart.size || state.checkingOut, onclick: checkout },
-            state.checkingOut ? 'Charging…' : `Charge ${moneyC(t.total)}`)));
-    }
-
-    redraw = () => { paintGrid(); paintCart(); };
-    redraw();
-    return h('div', { class: 'pos' }, h('div', { class: 'catalog' }, search, grid), cartBox);
-  }
-
-  // ---------------------------------------------------------------- inventory
-  function medicineForm(m) {
-    const editing = Boolean(m);
-    openForm({
-      title: editing ? `Edit ${m.name}` : 'Add medicine',
-      submitLabel: editing ? 'Save changes' : 'Add medicine',
-      fields: [
-        { name: 'name', label: 'Name', value: m?.name, maxlength: 120 },
-        { name: 'category', label: 'Category', value: m?.category, maxlength: 60 },
-        { name: 'price', label: `Price (${state.cfg.currency})`, type: 'number', min: 0, step: '0.01', value: m?.price },
-        { name: 'stock', label: 'Units in stock', type: 'number', min: 0, step: '1', value: m?.stock },
-        { name: 'expiry', label: 'Expiry date', type: 'date', value: m?.expiry, min: editing ? undefined : localDate() },
-        { name: 'barcode', label: 'Barcode', value: m?.barcode, required: false, maxlength: 64, help: 'Optional. Scan it here to save typing.' },
-      ],
-      onSubmit: async (v) => {
-        const body = {
-          name: v.name.trim(), category: v.category.trim(),
-          price: Number(v.price), stock: Number.parseInt(v.stock, 10), expiry: v.expiry,
-          barcode: v.barcode.trim() || undefined,
-        };
-        if (!Number.isFinite(body.price) || body.price < 0) throw new Error('Enter a valid price.');
-        if (!Number.isInteger(body.stock) || body.stock < 0) throw new Error('Stock must be a whole number.');
-        await api(editing ? `/medicines/${m.id}` : '/medicines', { method: editing ? 'PUT' : 'POST', body });
-        toast(editing ? 'Changes saved.' : `${body.name} added.`, 'success');
-        await refreshMedicines();
-      },
-    });
-  }
-
-  function restockForm(m) {
-    openForm({
-      title: `Restock ${m.name}`,
-      intro: `Currently ${plural(m.stock, 'unit')} in stock. Enter how many units arrived.`,
-      submitLabel: 'Add stock',
-      fields: [{ name: 'quantity', label: 'Units received', type: 'number', min: 1, max: 100000, step: '1' }],
-      onSubmit: async (v) => {
-        const quantity = Number.parseInt(v.quantity, 10);
-        if (!Number.isInteger(quantity) || quantity < 1) throw new Error('Enter a whole number of 1 or more.');
-        await api(`/medicines/${m.id}/restock`, { method: 'POST', body: { quantity } });
-        toast(`Added ${plural(quantity, 'unit')} to ${m.name}.`, 'success');
-        await refreshMedicines();
-      },
-    });
-  }
-
-  function viewInventory() {
-    const isAdmin = state.user.role === 'admin';
-    let q = '';
-    let f = 'all';
-    const body = h('div');
-
-    const search = h('input', {
-      type: 'search', class: 'search', 'aria-label': 'Search inventory', placeholder: 'Search by name, category or barcode',
-      oninput: debounce(() => { q = search.value.trim().toLowerCase(); redraw(); }, 150),
-    });
-    const filter = h('select', { 'aria-label': 'Filter by status', onchange: () => { f = filter.value; redraw(); } },
-      [['all', 'All medicines'], [STATUS.LOW, 'Running low'], [STATUS.EXPIRING, 'Expiring soon'], [STATUS.EXPIRED, 'Expired']]
-        .map(([value, label]) => h('option', { value }, label)));
-
-    redraw = () => {
-      const ctx = dateCtx();
-      const list = state.medicines.filter((m) => matchesQuery(m, q) && matchesFilter(m, f, ctx));
-      const shown = list.slice(0, RENDER_CAP);
-      if (!list.length) { body.replaceChildren(h('p', { class: 'note' }, 'No medicines match. Try a different search or filter.')); return; }
-      body.replaceChildren(
-        simpleTable(['Medicine', 'Category', 'Price', 'Stock', 'Expiry', 'Status', isAdmin ? 'Actions' : null].filter(Boolean),
-          shown.map((m) => h('tr', null,
-            h('td', null, h('strong', null, m.name), m.barcode ? h('div', { class: 'muted' }, m.barcode) : null),
-            h('td', null, m.category),
-            h('td', { class: 'num' }, money(m.price)),
-            h('td', { class: 'num' }, m.stock),
-            h('td', null, expiryText(m, ctx.today)),
-            h('td', null, statusBadge(statusOf(m, ctx)) || h('span', { class: 'muted' }, 'OK')),
-            isAdmin ? h('td', { class: 'row-actions' },
-              h('button', { class: 'btn small', type: 'button', onclick: () => restockForm(m) }, 'Restock'),
-              h('button', { class: 'btn small', type: 'button', onclick: () => medicineForm(m) }, 'Edit')) : null))),
-        list.length > shown.length ? h('p', { class: 'note' }, `Showing ${shown.length} of ${list.length}. Search to narrow it down.`) : null);
-    };
-    redraw();
-    return h('div', null,
-      h('div', { class: 'toolbar' }, search, filter,
-        isAdmin ? h('button', { class: 'btn primary', type: 'button', onclick: () => medicineForm(null) }, 'Add medicine') : null),
-      body);
-  }
-
-  // ---------------------------------------------------------------- sales history
-  const readSale = (s) => ({
-    id: s.saleId ?? s.id,
-    total: s.total,
-    at: s.createdAt ?? s.created_at,
-    by: s.cashier ?? s.username ?? '',
-    voided: Boolean(s.voided) || s.status === 'voided',
+    return Number(lastInsertRowid);
   });
+  audit(ctx.user, 'sale_created', `sale #${saleId}`, ctx.ip);
+  ctx.status = 201;
+  return { success: true, sale: loadSale(saleId) };
+});
 
-  function voidForm(sale, reload) {
-    openForm({
-      title: `Void sale #${sale.id}`,
-      intro: 'The items go back into stock and the sale is marked as voided. This can\'t be undone.',
-      submitLabel: 'Void sale',
-      danger: true,
-      fields: [{ name: 'reason', label: 'Reason', minlength: 3, maxlength: 200, help: 'For the audit log, e.g. "Customer returned".' }],
-      onSubmit: async (v) => {
-        const reason = v.reason.trim();
-        if (reason.length < 3) throw new Error('Enter a reason (3+ characters).');
-        await api(`/sales/${sale.id}/void`, { method: 'POST', body: { reason } });
-        toast(`Sale #${sale.id} voided.`, 'success');
-        await refreshMedicines().catch(() => {});
-        reload();
-      },
-    });
-  }
+route('GET', '/api/sales', (ctx) => {
+  const limit = clampInt(ctx.query.get('limit'), 1, 500, 200);
+  const base = 'SELECT s.*, u.username AS cashier FROM sales s JOIN users u ON u.id = s.user_id';
+  const rows = ctx.user.role === 'admin'
+    ? all(`${base} ORDER BY s.id DESC LIMIT ?`, limit)
+    : all(`${base} WHERE s.user_id = ? ORDER BY s.id DESC LIMIT ?`, ctx.user.id, limit);
+  return rows.map((s) => saleOut(s));
+});
 
-  function viewSales() {
-    return loadedView(
-      async () => { const d = await api('/sales'); return (Array.isArray(d) ? d : d.sales || []).map(readSale); },
-      (sales, reload) => {
-        if (!sales.length) return h('p', { class: 'note' }, 'No sales yet. They will show up here after the first checkout.');
-        return simpleTable(['Sale', 'When', 'Cashier', 'Total', 'Status', ''],
-          sales.slice(0, RENDER_CAP).map((s) => h('tr', null,
-            h('td', null, `#${s.id}`),
-            h('td', null, formatDateTime(s.at)),
-            h('td', null, s.by),
-            h('td', { class: 'num' }, money(s.total)),
-            h('td', null, s.voided ? h('span', { class: 'badge bad' }, 'Voided') : h('span', { class: 'badge ok' }, 'Paid')),
-            h('td', { class: 'row-actions' },
-              h('button', { class: 'btn small', type: 'button', onclick: () => downloadReceipt(s.id) }, 'Receipt'),
-              s.voided ? null : h('button', { class: 'btn small', type: 'button', onclick: () => voidForm(s, reload) }, 'Void')))));
-      });
-  }
+function ownSale(ctx) {
+  const sale = loadSale(parseId(ctx.params.id));
+  if (!sale) throw new HttpError(404, 'Sale not found.');
+  if (ctx.user.role !== 'admin' && sale.cashier !== ctx.user.username) throw new HttpError(403, "You don't have permission to view that sale.");
+  return sale;
+}
+route('GET', '/api/sales/:id/receipt', (ctx) => {
+  const sale = ownSale(ctx);
+  return raw(buildPdf(receiptLines(sale)), { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="receipt-${sale.saleId}.pdf"` });
+});
 
-  // ---------------------------------------------------------------- staff (admin)
-  function addUserForm(reload) {
-    openForm({
-      title: 'Add pharmacist',
-      submitLabel: 'Create account',
-      fields: [
-        { name: 'username', label: 'Username', maxlength: 30, autocapitalize: 'none', help: 'Not case-sensitive.' },
-        { name: 'password', label: 'Temporary password', type: 'password', autocomplete: 'new-password', minlength: 8, maxlength: 72, help: 'At least 8 characters. They can change it after signing in.' },
-      ],
-      onSubmit: async (v) => {
-        await api('/users', { method: 'POST', body: { username: v.username.trim(), password: v.password } });
-        toast(`${v.username.trim()} can now sign in.`, 'success');
-        reload();
-      },
-    });
-  }
-
-  function deleteUserForm(u, reload) {
-    openForm({
-      title: `Remove ${u.username}?`,
-      intro: 'They will no longer be able to sign in. Their past sales stay in the history.',
-      submitLabel: 'Remove account',
-      danger: true,
-      onSubmit: async () => {
-        await api(`/users/${u.id}`, { method: 'DELETE' });
-        toast(`${u.username} removed.`, 'success');
-        reload();
-      },
-    });
-  }
-
-  function viewUsers() {
-    return loadedView(() => api('/users'), (users, reload) => h('div', null,
-      h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', type: 'button', onclick: () => addUserForm(reload) }, 'Add pharmacist')),
-      simpleTable(['Username', 'Role', ''], users.map((u) => h('tr', null,
-        h('td', null, u.username),
-        h('td', null, u.role),
-        h('td', { class: 'row-actions' },
-          u.username === state.user.username ? h('span', { class: 'muted' }, 'You') :
-            h('button', { class: 'btn small danger', type: 'button', onclick: () => deleteUserForm(u, reload) }, 'Remove')))))));
-  }
-
-  // ---------------------------------------------------------------- boot
-  (async function boot() {
-    const saved = store.get(TOKEN_KEY);
-    if (!saved) return renderLogin();
-    state.token = saved;
-    try {
-      await loadSession();
-      renderShell();
-      bumpIdle();
-    } catch (e) {
-      // A 401 already ran logout() and showed the sign-in screen
-      if (state.token) { state.token = null; store.del(TOKEN_KEY); renderLogin(formatErr(e)); }
+route('POST', '/api/sales/:id/void', ADMIN, (ctx) => {
+  const id = parseId(ctx.params.id);
+  const reason = typeof ctx.body.reason === 'string' ? ctx.body.reason.trim() : '';
+  if (reason.length < 3 || reason.length > 200) throw new HttpError(400, 'Enter a reason (3 to 200 characters).');
+  tx(() => {
+    const s = get('SELECT * FROM sales WHERE id = ?', id);
+    if (!s) throw new HttpError(404, 'Sale not found.');
+    if (s.voided_at) throw new HttpError(409, 'That sale was already voided.');
+    for (const i of all('SELECT medicine_id, quantity FROM sale_items WHERE sale_id = ?', id)) {
+      run('UPDATE medicines SET stock = stock + ?, updated_at = ? WHERE id = ?', i.quantity, nowIso(), i.medicine_id);
     }
-  })();
-})();
+    run('UPDATE sales SET voided_at = ?, void_reason = ?, voided_by = ? WHERE id = ?', nowIso(), reason, ctx.user.id, id);
+  });
+  audit(ctx.user, 'sale_voided', `sale #${id}: ${reason}`, ctx.ip);
+  return { success: true, sale: loadSale(id) };
+});
+
+// ---------------------------------------------------------------- routes: dashboard, users, audit log
+route('GET', '/api/dashboard/stats', (ctx) => {
+  const day = new Date(); day.setHours(0, 0, 0, 0);
+  const today = localDate();
+  const soon = addDays(CFG.expiryWarnDays);
+  const mine = ctx.user.role === 'admin' ? 0 : ctx.user.id; // pharmacists see their own takings; 0 means everyone
+  const sales = get('SELECT COUNT(*) AS n, COALESCE(SUM(total_c), 0) AS total FROM sales WHERE created_at >= ? AND voided_at IS NULL AND (? = 0 OR user_id = ?)', day.toISOString(), mine, mine);
+  const m = get(
+    `SELECT COUNT(*) AS total,
+       COALESCE(SUM(CASE WHEN expiry >= ? AND stock <= ? THEN 1 ELSE 0 END), 0) AS low,
+       COALESCE(SUM(CASE WHEN expiry >= ? AND expiry <= ? THEN 1 ELSE 0 END), 0) AS expiring,
+       COALESCE(SUM(CASE WHEN expiry < ? AND stock > 0 THEN 1 ELSE 0 END), 0) AS expired
+     FROM medicines`, today, CFG.lowStockThreshold, today, soon, today);
+  return { success: true, today: { sales: sales.n, revenue: sales.total / 100 }, medicines: { total: m.total, lowStock: m.low, expiringSoon: m.expiring, expiredInStock: m.expired } };
+});
+
+route('GET', '/api/users', ADMIN, () =>
+  all('SELECT id, username, role, created_at FROM users WHERE active = 1 ORDER BY username').map((u) => ({ ...userOut(u), createdAt: u.created_at })));
+
+route('POST', '/api/users', ADMIN, async (ctx) => {
+  const username = typeof ctx.body.username === 'string' ? ctx.body.username.trim().toLowerCase() : '';
+  const password = ctx.body.password;
+  const role = ctx.body.role === 'admin' ? 'admin' : 'pharmacist';
+  if (!/^[a-z0-9._-]{3,30}$/.test(username)) throw new HttpError(400, 'Username must be 3 to 30 letters, numbers, dots, dashes or underscores.');
+  if (typeof password !== 'string' || password.length < 8 || password.length > 72) throw new HttpError(400, 'Password must be 8 to 72 characters.');
+  if (get('SELECT id FROM users WHERE username = ?', username)) throw new HttpError(409, 'That username is already taken.');
+  const { lastInsertRowid } = run('INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)', username, await hashPassword(password), role, nowIso());
+  audit(ctx.user, 'user_created', `${username} (${role})`, ctx.ip);
+  ctx.status = 201;
+  return { success: true, id: Number(lastInsertRowid), username, role };
+});
+
+route('DELETE', '/api/users/:id', ADMIN, (ctx) => {
+  const id = parseId(ctx.params.id);
+  if (id === ctx.user.id) throw new HttpError(400, "You can't remove your own account.");
+  const u = get('SELECT * FROM users WHERE id = ? AND active = 1', id);
+  if (!u) throw new HttpError(404, 'User not found.');
+  if (u.role === 'admin' && get("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1").n <= 1) throw new HttpError(400, "You can't remove the last admin.");
+  run('UPDATE users SET active = 0, token_version = token_version + 1 WHERE id = ?', id); // soft delete keeps sales history intact
+  audit(ctx.user, 'user_removed', u.username, ctx.ip);
+  return { success: true };
+});
+
+route('GET', '/api/audit-logs', ADMIN, (ctx) =>
+  all('SELECT id, username, action, detail, ip, created_at FROM audit_logs ORDER BY id DESC LIMIT ?', clampInt(ctx.query.get('limit'), 1, 1000, 200))
+    .map((a) => ({ id: a.id, username: a.username, action: a.action, detail: a.detail, ip: a.ip, createdAt: a.created_at })));
+
+// ---------------------------------------------------------------- static frontend
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8', '.webmanifest': 'application/manifest+json' };
+const plain = (res, status, text) => { res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end(text); };
+
+function serveStatic(req, res, url) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, { Allow: 'GET, HEAD' }); return res.end(); }
+  let rel;
+  try { rel = decodeURIComponent(url.pathname); } catch { return plain(res, 400, 'Bad request'); }
+  if (rel.includes('\0')) return plain(res, 400, 'Bad request');
+  if (rel.endsWith('/')) rel += 'index.html';
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) return plain(res, 403, 'Forbidden');
+  fs.readFile(file, (err, data) => {
+    if (err) return plain(res, 404, 'Not found');
+    const ext = path.extname(file).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Content-Length': data.length,
+      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
+    });
+    res.end(req.method === 'HEAD' ? undefined : data);
+  });
+}
+
+// ---------------------------------------------------------------- bootstrap & server
+async function bootstrap() {
+  if (!get("SELECT id FROM users WHERE role = 'admin' AND active = 1 LIMIT 1")) {
+    const pw = env.ADMIN_PASSWORD;
+    if (!pw || pw.length < 8) fatal('No admin account exists yet. Set ADMIN_PASSWORD (8+ characters) for the first start.');
+    const username = (env.ADMIN_USERNAME || 'admin').trim().toLowerCase();
+    run('INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)', username, await hashPassword(pw), 'admin', nowIso());
+    console.log(`Created admin account "${username}". You can now remove ADMIN_PASSWORD from the environment.`);
+  }
+  if (CFG.seedDemo && get('SELECT COUNT(*) AS n FROM medicines').n === 0) {
+    const demo = [
+      ['Paracetamol 500mg', 'Pain relief', 4, 120, addDays(540), '6001000000011'],
+      ['Ibuprofen 400mg', 'Pain relief', 9, 80, addDays(400), '6001000000028'],
+      ['Amoxicillin 500mg', 'Antibiotics', 25, 60, addDays(300), '6001000000035'],
+      ['Cetirizine 10mg', 'Allergy', 12, 45, addDays(45), '6001000000042'],
+      ['Oral Rehydration Salts', 'Digestive health', 30, 6, addDays(400), '6001000000059'],
+      ['Vitamin C 1000mg', 'Supplements', 18, 90, addDays(600), '6001000000066'],
+    ];
+    const t = nowIso();
+    for (const [n, c, p, s, e, b] of demo) run('INSERT INTO medicines (name, category, price_c, stock, expiry, barcode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', n, c, p * 100, s, e, b, t, t);
+    console.log('Loaded demo medicines (set SEED_DEMO=false to skip this).');
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  try {
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch { return plain(res, 400, 'Bad request'); }
+    if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);
+    else serveStatic(req, res, url);
+  } catch (e) { sendError(res, e); }
+});
+server.keepAliveTimeout = 65_000;
+
+function shutdown(signal) {
+  console.log(`${signal} received, shutting down...`);
+  server.close(() => { try { db.close(); } catch { /* ignore */ } process.exit(0); });
+  server.closeAllConnections();
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('uncaughtException', (e) => { console.error('Uncaught exception:', e); process.exit(1); }); // the service manager restarts us
+process.on('unhandledRejection', (e) => { console.error('Unhandled rejection:', e); process.exit(1); });
+
+bootstrap().then(() => {
+  server.listen(CFG.port, CFG.host, () => console.log(`PharmaDawa running at http://${CFG.host}:${CFG.port}`));
+}).catch((e) => { console.error('Startup failed:', e); process.exit(1); });
