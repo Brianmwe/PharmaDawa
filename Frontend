@@ -15,10 +15,10 @@
   const VIEW = Object.freeze({ POS: 'pos', INVENTORY: 'inventory', SALES: 'sales', USERS: 'users' });
   const STATUS = Object.freeze({ OK: 'ok', LOW: 'low', OUT: 'out', EXPIRING: 'expiring', EXPIRED: 'expired' });
   const TITLES = {
-    [VIEW.POS]: 'Point of Sale',
-    [VIEW.INVENTORY]: 'Inventory Management',
-    [VIEW.SALES]: 'Sales History',
-    [VIEW.USERS]: 'User Management',
+    [VIEW.POS]: 'Point of sale',
+    [VIEW.INVENTORY]: 'Inventory',
+    [VIEW.SALES]: 'Sales history',
+    [VIEW.USERS]: 'Staff accounts',
   };
 
   const state = {
@@ -49,6 +49,7 @@
   const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return localDate(d); };
   // "today" and the expiry-warning cutoff, computed once per render instead of once per medicine
   const dateCtx = () => ({ today: localDate(), soon: addDays(state.cfg.expiryWarnDays) });
+  const daysBetween = (from, to) => Math.round((Date.parse(`${to}T00:00:00`) - Date.parse(`${from}T00:00:00`)) / 864e5);
 
   const cents = (n) => Math.round(Number(n) * 100);
   const money = (n) => `${state.cfg.currency} ${Number(n).toFixed(2)}`;
@@ -57,6 +58,7 @@
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
   const repaint = () => { if (redraw) redraw(); };
   const resetCart = () => { cart.clear(); checkoutKey = null; };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
   // Random 128-bit hex key. crypto.randomUUID() needs HTTPS; getRandomValues works everywhere.
   const randomKey = () => {
@@ -113,7 +115,11 @@
     const run = async () => {
       box.replaceChildren(h('p', { class: 'note' }, 'Loading…'));
       try { box.replaceChildren(build(await load(), run)); }
-      catch (e) { box.replaceChildren(h('p', { class: 'form-error', role: 'alert' }, formatErr(e))); }
+      catch (e) {
+        box.replaceChildren(
+          h('p', { class: 'form-error', role: 'alert' }, formatErr(e)),
+          h('button', { class: 'btn small', type: 'button', onclick: run }, 'Try again'));
+      }
     };
     run();
     return box;
@@ -136,7 +142,7 @@
         method, headers: hdrs, cache: 'no-store', signal: ctrl.signal,
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
-      if (res.ok && raw) return res;
+      if (res.ok && raw) return await res.blob();
       let data = null;
       try { data = await res.json(); } catch { /* non-JSON body */ }
       if (!res.ok) {
@@ -194,13 +200,23 @@
   function statusOf(m, { today, soon } = dateCtx()) {
     if (m.expiry < today) return { key: STATUS.EXPIRED, label: 'Expired', cls: 'bad' };
     if (m.stock <= 0) return { key: STATUS.OUT, label: 'Out of stock', cls: 'bad' };
-    if (m.stock <= state.cfg.lowStockThreshold) return { key: STATUS.LOW, label: 'Low stock', cls: 'warn' };
-    if (m.expiry <= soon) return { key: STATUS.EXPIRING, label: 'Expiring soon', cls: 'warn' };
+    if (m.stock <= state.cfg.lowStockThreshold) return { key: STATUS.LOW, label: 'Running low', cls: 'warn' };
+    if (m.expiry <= soon) return { key: STATUS.EXPIRING, label: 'Expires soon', cls: 'warn' };
     return { key: STATUS.OK, label: 'In stock', cls: 'ok' };
   }
   const isSellable = (m, today = localDate()) => m.stock > 0 && m.expiry >= today;
 
+  function expiryText(m, today = localDate()) {
+    const d = daysBetween(today, m.expiry);
+    if (Number.isNaN(d)) return m.expiry;
+    if (d < 0) return `Expired ${plural(-d, 'day')} ago`;
+    if (d === 0) return 'Expires today';
+    if (d <= state.cfg.expiryWarnDays) return `Expires in ${plural(d, 'day')}`;
+    return `Expires ${m.expiry}`;
+  }
+
   function matchesFilter(m, f, { today, soon } = dateCtx()) {
+    if (f === 'all') return true;
     if (f === STATUS.EXPIRED) return m.expiry < today;
     if (m.expiry < today) return false;
     if (f === STATUS.LOW) return m.stock <= state.cfg.lowStockThreshold;
@@ -223,7 +239,7 @@
     box.replaceChildren(
       expired ? h('span', { class: 'badge bad' }, `${expired} expired in stock`) : null,
       exp ? h('span', { class: 'badge warn' }, `${exp} expiring soon`) : null,
-      low ? h('span', { class: 'badge warn' }, `${low} low stock`) : null,
+      low ? h('span', { class: 'badge warn' }, `${low} running low`) : null,
     );
   }
 
@@ -270,7 +286,7 @@
     }, intro ? h('p', null, intro) : null, rows, err, h('div', { class: 'actions end' }, cancel, submit));
     const dlg = modal(title, form);
     const first = form.querySelector('input, select');
-    if (first) first.focus();
+    (first || submit).focus();
     return dlg;
   }
 
@@ -283,7 +299,9 @@
         { name: 'newPassword', label: 'New password', type: 'password', autocomplete: 'new-password', minlength: 8, maxlength: 72, help: 'At least 8 characters.' },
       ],
       onSubmit: async (v) => {
-        await api('/auth/password', { method: 'POST', body: { currentPassword: v.currentPassword, newPassword: v.newPassword } });
+        const res = await api('/auth/change-password', { method: 'POST', body: { currentPassword: v.currentPassword, newPassword: v.newPassword } });
+        // The server revokes the old token when the password changes, so keep the fresh one.
+        if (res && res.token) { state.token = res.token; store.set(TOKEN_KEY, res.token); }
         toast('Password updated.', 'success');
       },
     });
@@ -321,7 +339,7 @@
     },
     h('span', { class: 'logo', 'aria-hidden': 'true' }, 'Rx'),
     h('h1', null, 'PharmaDawa'),
-    h('p', { class: 'sub' }, 'Sign in to the pharmacy system'),
+    h('p', { class: 'sub' }, 'Sign in to start your shift'),
     h('label', { class: 'field' }, h('span', null, 'Username'), user),
     h('label', { class: 'field' }, h('span', null, 'Password'), pass),
     err, btn);
@@ -331,8 +349,8 @@
 
   // ---------------------------------------------------------------- shell
   function renderShell() {
-    const views = [[VIEW.POS, 'Point of Sale'], [VIEW.INVENTORY, 'Inventory'], [VIEW.SALES, 'Sales']];
-    if (state.user.role === 'admin') views.push([VIEW.USERS, 'Users']);
+    const views = [[VIEW.POS, 'Point of sale'], [VIEW.INVENTORY, 'Inventory'], [VIEW.SALES, 'Sales']];
+    if (state.user.role === 'admin') views.push([VIEW.USERS, 'Staff']);
 
     const nav = h('nav', { 'aria-label': 'Main' }, views.map(([key, label]) =>
       h('button', { class: 'nav-btn', type: 'button', 'data-view': key, onclick: () => showView(key) }, label)));
@@ -342,7 +360,7 @@
       h('div', { class: 'top-right' },
         h('div', { id: 'alerts', class: 'top-right' }),
         h('span', { id: 'clock', class: 'clock' }),
-        h('span', { class: 'badge' }, `${state.user.username} · ${state.user.role}`),
+        h('span', { class: 'badge' }, `${state.user.username} (${state.user.role})`),
         h('button', { class: 'btn small', type: 'button', onclick: changePasswordForm }, 'Change password'),
         h('button', { class: 'btn small', type: 'button', onclick: () => logout('You have been signed out.') }, 'Sign out')));
     root.replaceChildren(h('div', { class: 'app' }, sidebar, h('div', { class: 'main' }, topbar, h('div', { id: 'view', class: 'view' }))));
@@ -400,14 +418,14 @@
     const m = medById(id);
     if (!m || !isSellable(m)) return;
     const q = cart.get(id) || 0;
-    if (q >= m.stock) return toast(`No more stock available for ${m.name}.`, 'error');
+    if (q >= m.stock) return toast(`That's all the ${m.name} in stock.`, 'error');
     cart.set(id, Math.min(q + 1, MAX_LINE_QTY));
     checkoutKey = null;
     repaint();
   }
   function setQty(id, q) {
     const m = medById(id);
-    if (!m || q <= 0) cart.delete(id); else cart.set(id, Math.min(q, m.stock, MAX_LINE_QTY));
+    if (!m || !Number.isFinite(q) || q <= 0) cart.delete(id); else cart.set(id, Math.min(Math.floor(q), m.stock, MAX_LINE_QTY));
     checkoutKey = null;
     repaint();
   }
@@ -426,439 +444,308 @@
     repaint();
     checkoutKey = checkoutKey || randomKey(); // a retry of the same cart reuses the key, so it can't double-charge
     try {
-      const sale = await api('/sales', {
+      const res = await api('/sales', {
         method: 'POST',
         headers: { 'Idempotency-Key': checkoutKey },
-        body: { items: [...cart].map(([medicineId, quantity]) => ({ medicineId
-'use strict';
-// PharmaDawa frontend. Zero dependencies, zero innerHTML, zero inline handlers:
-// every piece of dynamic text is inserted as a text node, so injected markup can never execute.
-// NOTE: client-side checks are UX only. The server must re-validate stock, expiry, prices, tax and roles.
-(() => {
-  // ---------------------------------------------------------------- config
-  const API_BASE = (document.querySelector('meta[name="api-base"]')?.content || '/api').replace(/\/+$/, '');
-  const IDLE_MS = 15 * 60 * 1000;      // auto sign-out on shared counters
-  const REQUEST_TIMEOUT_MS = 15000;
-  const REFRESH_STALE_MS = 30000;      // refetch stock when a hidden tab becomes visible after this long
-  const MAX_LINE_QTY = 1000;           // matches the server limit
-  const RENDER_CAP = 120;              // max cards/rows drawn at once
-  const TOKEN_KEY = 'pd_token';
-
-  const VIEW = Object.freeze({ POS: 'pos', INVENTORY: 'inventory', SALES: 'sales', USERS: 'users' });
-  const STATUS = Object.freeze({ OK: 'ok', LOW: 'low', OUT: 'out', EXPIRING: 'expiring', EXPIRED: 'expired' });
-  const TITLES = {
-    [VIEW.POS]: 'Point of Sale',
-    [VIEW.INVENTORY]: 'Inventory Management',
-    [VIEW.SALES]: 'Sales History',
-    [VIEW.USERS]: 'User Management',
-  };
-
-  const state = {
-    token: null,
-    user: null,
-    cfg: { currency: 'KES', taxRate: 0.05, lowStockThreshold: 10, expiryWarnDays: 60 },
-    medicines: [],
-    view: VIEW.POS,
-    checkingOut: false,
-  };
-  const cart = new Map();              // medicineId -> quantity (prices always come from the server)
-  let checkoutKey = null;              // idempotency key for the current cart
-  let redraw = null;                   // repaint function of the active view
-  let idleTimer = null;
-  let lastRefresh = 0;
-
-  const root = document.getElementById('app');
-  const $ = (sel, scope = document) => scope.querySelector(sel);
-
-  // ---------------------------------------------------------------- helpers
-  const store = {
-    get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-    set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage unavailable */ } },
-    del(k) { try { sessionStorage.removeItem(k); } catch { /* ignore */ } },
-  };
-  const pad = (n) => String(n).padStart(2, '0');
-  const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const addDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return localDate(d); };
-  // "today" and the expiry-warning cutoff, computed once per render instead of once per medicine
-  const dateCtx = () => ({ today: localDate(), soon: addDays(state.cfg.expiryWarnDays) });
-
-  const cents = (n) => Math.round(Number(n) * 100);
-  const money = (n) => `${state.cfg.currency} ${Number(n).toFixed(2)}`;
-  const moneyC = (c) => money(c / 100);
-  const medById = (id) => state.medicines.find((m) => m.id === id);
-  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
-  const repaint = () => { if (redraw) redraw(); };
-  const resetCart = () => { cart.clear(); checkoutKey = null; };
-
-  // Random 128-bit hex key. crypto.randomUUID() needs HTTPS; getRandomValues works everywhere.
-  const randomKey = () => {
-    const b = new Uint8Array(16); crypto.getRandomValues(b);
-    return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-  };
-  const formatErr = (e) => {
-    const base = (e && e.message) || 'Something went wrong.';
-    return e && Array.isArray(e.details) && e.details.length ? `${base}: ${e.details.join('; ')}` : base;
-  };
-  const formatDateTime = (v) => { const d = new Date(v); return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(); };
-
-  // Safe DOM builder: strings become text nodes. There is deliberately no way to pass raw HTML.
-  function append(node, kids) {
-    for (const k of kids.flat(Infinity)) {
-      if (k === null || k === undefined || k === false) continue;
-      node.append(k instanceof Node ? k : document.createTextNode(String(k)));
-    }
-  }
-  function h(tag, attrs, ...kids) {
-    const n = document.createElement(tag);
-    let value;
-    if (attrs) {
-      for (const [k, v] of Object.entries(attrs)) {
-        if (v === null || v === undefined || v === false) continue;
-        if (k === 'value') value = v;
-        else if (k === 'class') n.className = v;
-        else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
-        else n.setAttribute(k, v === true ? '' : String(v));
-      }
-    }
-    append(n, kids);
-    if (value !== undefined) n.value = value; // after children so <select> options exist
-    return n;
-  }
-
-  function toast(msg, type = 'info') {
-    let box = $('#toasts');
-    if (!box) { box = h('div', { id: 'toasts', 'aria-live': 'polite' }); document.body.append(box); }
-    const t = h('div', { class: `toast ${type}`, role: type === 'error' ? 'alert' : 'status' }, msg);
-    box.append(t);
-    setTimeout(() => t.remove(), type === 'error' ? 7000 : 3500);
-  }
-
-  const statusBadge = (st) => (st.key === STATUS.OK ? null : h('span', { class: `badge ${st.cls}` }, st.label));
-  const simpleTable = (headers, rows) =>
-    h('div', { class: 'table-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, headers.map((t) => h('th', { scope: 'col' }, t)))),
-      h('tbody', null, rows)));
-
-  // Loads data, shows "Loading…" / the error, and hands build() a reload function.
-  function loadedView(load, build) {
-    const box = h('div');
-    const run = async () => {
-      box.replaceChildren(h('p', { class: 'note' }, 'Loading…'));
-      try { box.replaceChildren(build(await load(), run)); }
-      catch (e) { box.replaceChildren(h('p', { class: 'form-error', role: 'alert' }, formatErr(e))); }
-    };
-    run();
-    return box;
-  }
-
-  // ---------------------------------------------------------------- API
-  class ApiError extends Error {
-    constructor(status, message, details) { super(message); this.status = status; this.details = details; }
-  }
-
-  async function api(path, { method = 'GET', body, auth = true, raw = false, soft401 = false, headers = {} } = {}) {
-    const ctrl = new AbortController();
-    // The timer stays armed until the body has been read, so a stalled response can't hang forever.
-    const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-    const hdrs = { ...headers };
-    if (body !== undefined) hdrs['Content-Type'] = 'application/json';
-    if (auth && state.token) hdrs.Authorization = `Bearer ${state.token}`;
-    try {
-      const res = await fetch(API_BASE + path, {
-        method, headers: hdrs, cache: 'no-store', signal: ctrl.signal,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
+        body: { items: [...cart].map(([medicineId, quantity]) => ({ medicineId, quantity })) },
       });
-      if (res.ok && raw) return res;
-      let data = null;
-      try { data = await res.json(); } catch { /* non-JSON body */ }
-      if (!res.ok) {
-        if (res.status === 401 && auth && !soft401 && state.token) logout('Your session has ended. Please sign in again.');
-        throw new ApiError(res.status, (data && data.error) || `Request failed (${res.status}).`, data && data.details);
-      }
-      return data;
+      resetCart();
+      state.checkingOut = false;
+      showSaleDone(res.sale);
+      await refreshMedicines().catch(() => toast("Sale saved, but stock couldn't refresh. Reload to update.", 'error'));
     } catch (e) {
-      if (e instanceof ApiError) throw e;
-      throw new ApiError(0, e.name === 'AbortError'
-        ? 'The server took too long to respond.'
-        : 'Cannot reach the server. Check your connection.');
+      toast(formatErr(e), 'error');
+      // A 400/409 usually means stock changed under us: reload it so the cart reflects reality.
+      if (e.status === 400 || e.status === 409) { checkoutKey = null; await refreshMedicines().catch(() => {}); }
     } finally {
-      clearTimeout(timer);
+      state.checkingOut = false;
+      repaint();
     }
   }
 
-  // ---------------------------------------------------------------- session
-  function bumpIdle() {
-    if (!state.token) return;
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => logout('Signed out after 15 minutes of inactivity.'), IDLE_MS);
-  }
-  ['click', 'keydown', 'pointerdown', 'touchstart'].forEach((ev) => document.addEventListener(ev, bumpIdle, { passive: true }));
-
-  function logout(message) {
-    state.token = null; state.user = null; state.medicines = [];
-    resetCart(); redraw = null;
-    store.del(TOKEN_KEY);
-    clearTimeout(idleTimer);
-    document.querySelectorAll('dialog').forEach((d) => d.close());
-    renderLogin(message);
+  async function downloadReceipt(saleId) {
+    try {
+      const blob = await api(`/sales/${saleId}/receipt`, { raw: true });
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: `receipt-${saleId}.pdf` });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (e) { toast(formatErr(e), 'error'); }
   }
 
-  async function fetchMedicines() {
-    state.medicines = await api('/medicines?limit=5000');
-    lastRefresh = Date.now();
+  function showSaleDone(sale) {
+    const row = (label, value, cls) => h('div', { class: `sum-row ${cls || ''}` }, h('span', null, label), h('span', null, money(value)));
+    const done = h('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, 'Start next sale');
+    const dlg = modal('Sale complete', h('div', null,
+      row('Subtotal', sale.subtotal), row(`Tax`, sale.tax), row('Total', sale.total, 'total'),
+      h('div', { class: 'actions end' },
+        h('button', { class: 'btn', type: 'button', onclick: () => downloadReceipt(sale.saleId) }, 'Download receipt'),
+        done)));
+    done.focus();
   }
 
-  async function loadSession() {
-    const cfg = await api('/config');
-    state.user = cfg.user;
-    state.cfg = { currency: cfg.currency, taxRate: cfg.taxRate, lowStockThreshold: cfg.lowStockThreshold, expiryWarnDays: cfg.expiryWarnDays };
-    await fetchMedicines();
-  }
+  function viewPOS() {
+    let q = '';
+    const grid = h('div', { class: 'cards' });
+    const cartBox = h('section', { class: 'cart', 'aria-label': 'Current sale' });
 
-  async function refreshMedicines() {
-    await fetchMedicines();
-    pruneCart();
-    updateHeader();
-    repaint();
-  }
-
-  // ---------------------------------------------------------------- medicine status
-  function statusOf(m, { today, soon } = dateCtx()) {
-    if (m.expiry < today) return { key: STATUS.EXPIRED, label: 'Expired', cls: 'bad' };
-    if (m.stock <= 0) return { key: STATUS.OUT, label: 'Out of stock', cls: 'bad' };
-    if (m.stock <= state.cfg.lowStockThreshold) return { key: STATUS.LOW, label: 'Low stock', cls: 'warn' };
-    if (m.expiry <= soon) return { key: STATUS.EXPIRING, label: 'Expiring soon', cls: 'warn' };
-    return { key: STATUS.OK, label: 'In stock', cls: 'ok' };
-  }
-  const isSellable = (m, today = localDate()) => m.stock > 0 && m.expiry >= today;
-
-  function matchesFilter(m, f, { today, soon } = dateCtx()) {
-    if (f === STATUS.EXPIRED) return m.expiry < today;
-    if (m.expiry < today) return false;
-    if (f === STATUS.LOW) return m.stock <= state.cfg.lowStockThreshold;
-    if (f === STATUS.EXPIRING) return m.expiry <= soon;
-    return true;
-  }
-  const matchesQuery = (m, q) =>
-    !q || m.name.toLowerCase().includes(q) || m.category.toLowerCase().includes(q) || (m.barcode && m.barcode.toLowerCase() === q);
-
-  function updateHeader() {
-    const box = $('#alerts');
-    if (!box) return;
-    const { today, soon } = dateCtx();
-    let low = 0, exp = 0, expired = 0;
-    for (const m of state.medicines) {
-      if (m.expiry < today) { if (m.stock > 0) expired++; continue; }
-      if (m.stock <= state.cfg.lowStockThreshold) low++;
-      if (m.expiry <= soon) exp++;
-    }
-    box.replaceChildren(
-      expired ? h('span', { class: 'badge bad' }, `${expired} expired in stock`) : null,
-      exp ? h('span', { class: 'badge warn' }, `${exp} expiring soon`) : null,
-      low ? h('span', { class: 'badge warn' }, `${low} low stock`) : null,
-    );
-  }
-
-  // ---------------------------------------------------------------- dialogs
-  function modal(title, content) {
-    const dlg = h('dialog', { class: 'modal', 'aria-label': title }, h('h2', null, title), content);
-    dlg.addEventListener('close', () => dlg.remove());
-    document.body.append(dlg);
-    dlg.showModal();
-    return dlg;
-  }
-
-  // Generic form dialog. onSubmit may throw; its message is shown inside the dialog and the dialog stays open.
-  function openForm({ title, intro, fields = [], submitLabel = 'Save', danger = false, onSubmit }) {
-    const err = h('p', { class: 'form-error', role: 'alert' });
-    const inputs = {};
-    const rows = fields.map((f) => {
-      const common = { name: f.name, id: `f-${f.name}`, required: f.required !== false, autocomplete: f.autocomplete || 'off' };
-      const input = f.type === 'select'
-        ? h('select', common, f.options.map((o) => h('option', { value: o.value }, o.label)))
-        : h('input', { ...common, type: f.type || 'text', min: f.min, max: f.max, step: f.step, maxlength: f.maxlength, minlength: f.minlength, pattern: f.pattern, title: f.title });
-      if (f.value !== undefined && f.value !== null) input.value = f.value;
-      inputs[f.name] = input;
-      return h('label', { class: 'field' }, h('span', null, f.label), input, f.help ? h('small', null, f.help) : null);
-    });
-    const cancel = h('button', { type: 'button', class: 'btn', onclick: () => dlg.close() }, 'Cancel');
-    const submit = h('button', { type: 'submit', class: `btn ${danger ? 'danger' : 'primary'}` }, submitLabel);
-    const form = h('form', {
-      onsubmit: async (e) => {
+    const search = h('input', {
+      type: 'search', class: 'search', 'aria-label': 'Search medicines',
+      placeholder: 'Search by name or category, or scan a barcode',
+      oninput: debounce(() => { q = search.value.trim().toLowerCase(); paintGrid(); }, 150),
+      onkeydown: (e) => {
+        if (e.key !== 'Enter') return;
         e.preventDefault();
-        if (!form.reportValidity()) return;
-        err.textContent = '';
-        submit.disabled = true; cancel.disabled = true;
-        try {
-          const values = {};
-          for (const [k, el] of Object.entries(inputs)) values[k] = el.value;
-          await onSubmit(values);
-          dlg.close();
-        } catch (ex) {
-          err.textContent = formatErr(ex);
-          submit.disabled = false; cancel.disabled = false;
-        }
+        const code = search.value.trim().toLowerCase();
+        const hit = code && state.medicines.find((m) => m.barcode && m.barcode.toLowerCase() === code);
+        if (!hit) return toast('No medicine with that barcode.', 'error');
+        if (!isSellable(hit)) return toast(`${hit.name} can't be sold right now.`, 'error');
+        addToCart(hit.id);
+        search.value = ''; q = ''; paintGrid();
       },
-    }, intro ? h('p', null, intro) : null, rows, err, h('div', { class: 'actions end' }, cancel, submit));
-    const dlg = modal(title, form);
-    const first = form.querySelector('input, select');
-    if (first) first.focus();
-    return dlg;
+    });
+
+    function paintGrid() {
+      const ctx = dateCtx();
+      const list = state.medicines.filter((m) => matchesQuery(m, q));
+      const shown = list.slice(0, RENDER_CAP);
+      const cards = shown.map((m) => {
+        const st = statusOf(m, ctx);
+        const sellable = isSellable(m, ctx.today);
+        return h('button', {
+          type: 'button', class: `card ${sellable ? '' : 'off'}`, disabled: !sellable,
+          onclick: () => addToCart(m.id),
+          'aria-label': `Add ${m.name} to sale`,
+        },
+        h('strong', null, m.name),
+        h('span', { class: 'muted' }, m.category),
+        h('span', { class: 'price' }, money(m.price)),
+        h('span', { class: 'muted' }, `${m.stock} in stock · ${expiryText(m, ctx.today)}`),
+        statusBadge(st));
+      });
+      grid.replaceChildren(
+        ...(cards.length ? cards : [h('p', { class: 'note' }, q ? `Nothing matches "${search.value.trim()}". Check the spelling or try the category.` : 'No medicines yet. An admin can add them under Inventory.')]),
+        list.length > shown.length ? h('p', { class: 'note' }, `Showing ${shown.length} of ${list.length}. Type more to narrow it down.`) : null);
+    }
+
+    function paintCart() {
+      const t = cartTotals();
+      const lines = [...cart].map(([id, qty]) => {
+        const m = medById(id);
+        if (!m) return null;
+        return h('li', { class: 'line' },
+          h('div', { class: 'line-name' }, h('strong', null, m.name), h('span', { class: 'muted' }, `${money(m.price)} each`)),
+          h('div', { class: 'qty' },
+            h('button', { type: 'button', class: 'btn small', 'aria-label': `One less ${m.name}`, onclick: () => setQty(id, qty - 1) }, '−'),
+            h('input', {
+              type: 'number', min: 1, max: Math.min(m.stock, MAX_LINE_QTY), value: qty, 'aria-label': `Quantity of ${m.name}`,
+              onchange: (e) => setQty(id, Number(e.target.value)),
+            }),
+            h('button', { type: 'button', class: 'btn small', 'aria-label': `One more ${m.name}`, onclick: () => addToCart(id) }, '+')),
+          h('span', { class: 'line-total' }, moneyC(cents(m.price) * qty)),
+          h('button', { type: 'button', class: 'btn small', 'aria-label': `Remove ${m.name}`, onclick: () => setQty(id, 0) }, 'Remove'));
+      });
+      const row = (label, c, cls) => h('div', { class: `sum-row ${cls || ''}` }, h('span', null, label), h('span', null, moneyC(c)));
+      cartBox.replaceChildren(
+        h('h2', null, 'Current sale'),
+        cart.size ? h('ul', { class: 'lines' }, lines) : h('p', { class: 'note' }, 'Nothing here yet. Tap a medicine to add it.'),
+        row('Subtotal', t.sub), row(`Tax (${Math.round(state.cfg.taxRate * 1000) / 10}%)`, t.tax), row('Total', t.total, 'total'),
+        h('p', { class: 'note small' }, 'The server confirms the final price when you charge.'),
+        h('div', { class: 'actions' },
+          h('button', { type: 'button', class: 'btn', disabled: !cart.size || state.checkingOut, onclick: () => { resetCart(); repaint(); } }, 'Clear'),
+          h('button', { type: 'button', class: 'btn primary grow', disabled: !cart.size || state.checkingOut, onclick: checkout },
+            state.checkingOut ? 'Charging…' : `Charge ${moneyC(t.total)}`)));
+    }
+
+    redraw = () => { paintGrid(); paintCart(); };
+    redraw();
+    return h('div', { class: 'pos' }, h('div', { class: 'catalog' }, search, grid), cartBox);
   }
 
-  function changePasswordForm() {
+  // ---------------------------------------------------------------- inventory
+  function medicineForm(m) {
+    const editing = Boolean(m);
     openForm({
-      title: 'Change password',
-      submitLabel: 'Update password',
+      title: editing ? `Edit ${m.name}` : 'Add medicine',
+      submitLabel: editing ? 'Save changes' : 'Add medicine',
       fields: [
-        { name: 'currentPassword', label: 'Current password', type: 'password', autocomplete: 'current-password', maxlength: 72 },
-        { name: 'newPassword', label: 'New password', type: 'password', autocomplete: 'new-password', minlength: 8, maxlength: 72, help: 'At least 8 characters.' },
+        { name: 'name', label: 'Name', value: m?.name, maxlength: 120 },
+        { name: 'category', label: 'Category', value: m?.category, maxlength: 60 },
+        { name: 'price', label: `Price (${state.cfg.currency})`, type: 'number', min: 0, step: '0.01', value: m?.price },
+        { name: 'stock', label: 'Units in stock', type: 'number', min: 0, step: '1', value: m?.stock },
+        { name: 'expiry', label: 'Expiry date', type: 'date', value: m?.expiry, min: editing ? undefined : localDate() },
+        { name: 'barcode', label: 'Barcode', value: m?.barcode, required: false, maxlength: 64, help: 'Optional. Scan it here to save typing.' },
       ],
       onSubmit: async (v) => {
-        await api('/auth/password', { method: 'POST', body: { currentPassword: v.currentPassword, newPassword: v.newPassword } });
-        toast('Password updated.', 'success');
+        const body = {
+          name: v.name.trim(), category: v.category.trim(),
+          price: Number(v.price), stock: Number.parseInt(v.stock, 10), expiry: v.expiry,
+          barcode: v.barcode.trim() || undefined,
+        };
+        if (!Number.isFinite(body.price) || body.price < 0) throw new Error('Enter a valid price.');
+        if (!Number.isInteger(body.stock) || body.stock < 0) throw new Error('Stock must be a whole number.');
+        await api(editing ? `/medicines/${m.id}` : '/medicines', { method: editing ? 'PUT' : 'POST', body });
+        toast(editing ? 'Changes saved.' : `${body.name} added.`, 'success');
+        await refreshMedicines();
       },
     });
   }
 
-  // ---------------------------------------------------------------- login
-  function renderLogin(message) {
-    redraw = null;
-    const err = h('p', { class: 'form-error', role: 'alert' }, message || '');
-    const user = h('input', { id: 'login-user', name: 'username', autocomplete: 'username', required: true, maxlength: 30, autocapitalize: 'none', spellcheck: 'false' });
-    const pass = h('input', { id: 'login-pass', name: 'password', type: 'password', autocomplete: 'current-password', required: true, maxlength: 72 });
-    const btn = h('button', { class: 'btn primary block', type: 'submit' }, 'Sign in');
-    const form = h('form', {
-      class: 'login-card',
-      onsubmit: async (e) => {
-        e.preventDefault();
-        const username = user.value.trim().toLowerCase();
-        if (!username || !pass.value) { err.textContent = 'Enter your username and password.'; return; }
-        err.textContent = ''; btn.disabled = true; btn.textContent = 'Signing in…';
-        try {
-          const res = await api('/auth/login', { method: 'POST', body: { username, password: pass.value }, auth: false });
-          state.token = res.token;
-          store.set(TOKEN_KEY, res.token);
-          pass.value = '';
-          await loadSession();
-          state.view = VIEW.POS;
-          renderShell();
-          bumpIdle();
-        } catch (ex) {
-          state.token = null; store.del(TOKEN_KEY);
-          err.textContent = formatErr(ex);
-          btn.disabled = false; btn.textContent = 'Sign in';
-        }
+  function restockForm(m) {
+    openForm({
+      title: `Restock ${m.name}`,
+      intro: `Currently ${plural(m.stock, 'unit')} in stock. Enter how many units arrived.`,
+      submitLabel: 'Add stock',
+      fields: [{ name: 'quantity', label: 'Units received', type: 'number', min: 1, max: 100000, step: '1' }],
+      onSubmit: async (v) => {
+        const quantity = Number.parseInt(v.quantity, 10);
+        if (!Number.isInteger(quantity) || quantity < 1) throw new Error('Enter a whole number of 1 or more.');
+        await api(`/medicines/${m.id}/restock`, { method: 'POST', body: { quantity } });
+        toast(`Added ${plural(quantity, 'unit')} to ${m.name}.`, 'success');
+        await refreshMedicines();
       },
-    },
-    h('span', { class: 'logo', 'aria-hidden': 'true' }, 'Rx'),
-    h('h1', null, 'PharmaDawa'),
-    h('p', { class: 'sub' }, 'Sign in to the pharmacy system'),
-    h('label', { class: 'field' }, h('span', null, 'Username'), user),
-    h('label', { class: 'field' }, h('span', null, 'Password'), pass),
-    err, btn);
-    root.replaceChildren(h('div', { class: 'login-wrap' }, form));
-    user.focus();
-  }
-
-  // ---------------------------------------------------------------- shell
-  function renderShell() {
-    const views = [[VIEW.POS, 'Point of Sale'], [VIEW.INVENTORY, 'Inventory'], [VIEW.SALES, 'Sales']];
-    if (state.user.role === 'admin') views.push([VIEW.USERS, 'Users']);
-
-    const nav = h('nav', { 'aria-label': 'Main' }, views.map(([key, label]) =>
-      h('button', { class: 'nav-btn', type: 'button', 'data-view': key, onclick: () => showView(key) }, label)));
-    const sidebar = h('aside', { class: 'sidebar' }, h('div', { class: 'brand' }, h('span', { class: 'logo', 'aria-hidden': 'true' }, 'Rx'), h('span', null, 'PharmaDawa')), nav);
-    const topbar = h('header', { class: 'topbar' },
-      h('h1', { id: 'page-title' }, TITLES[VIEW.POS]),
-      h('div', { class: 'top-right' },
-        h('div', { id: 'alerts', class: 'top-right' }),
-        h('span', { id: 'clock', class: 'clock' }),
-        h('span', { class: 'badge' }, `${state.user.username} · ${state.user.role}`),
-        h('button', { class: 'btn small', type: 'button', onclick: changePasswordForm }, 'Change password'),
-        h('button', { class: 'btn small', type: 'button', onclick: () => logout('You have been signed out.') }, 'Sign out')));
-    root.replaceChildren(h('div', { class: 'app' }, sidebar, h('div', { class: 'main' }, topbar, h('div', { id: 'view', class: 'view' }))));
-    updateHeader();
-    tickClock();
-    showView(views.some(([k]) => k === state.view) ? state.view : VIEW.POS);
-  }
-
-  function showView(key) {
-    if (key === VIEW.USERS && state.user.role !== 'admin') key = VIEW.POS;
-    state.view = key;
-    redraw = null;
-    document.querySelectorAll('.nav-btn').forEach((b) => {
-      if (b.dataset.view === key) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
     });
-    $('#page-title').textContent = TITLES[key];
-    document.title = `${TITLES[key]} - PharmaDawa`;
-    const builders = { [VIEW.POS]: viewPOS, [VIEW.INVENTORY]: viewInventory, [VIEW.SALES]: viewSales, [VIEW.USERS]: viewUsers };
-    $('#view').replaceChildren(builders[key]());
   }
 
-  function tickClock() {
-    const el = $('#clock');
-    if (el) el.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-  setInterval(tickClock, 15000);
+  function viewInventory() {
+    const isAdmin = state.user.role === 'admin';
+    let q = '';
+    let f = 'all';
+    const body = h('div');
 
-  document.addEventListener('visibilitychange', () => {
-    // Stock can change on another terminal while this tab was hidden
-    if (document.visibilityState === 'visible' && state.token && Date.now() - lastRefresh > REFRESH_STALE_MS) {
-      refreshMedicines().catch(() => toast("Couldn't refresh stock. Figures may be out of date.", 'error'));
-    }
+    const search = h('input', {
+      type: 'search', class: 'search', 'aria-label': 'Search inventory', placeholder: 'Search by name, category or barcode',
+      oninput: debounce(() => { q = search.value.trim().toLowerCase(); redraw(); }, 150),
+    });
+    const filter = h('select', { 'aria-label': 'Filter by status', onchange: () => { f = filter.value; redraw(); } },
+      [['all', 'All medicines'], [STATUS.LOW, 'Running low'], [STATUS.EXPIRING, 'Expiring soon'], [STATUS.EXPIRED, 'Expired']]
+        .map(([value, label]) => h('option', { value }, label)));
+
+    redraw = () => {
+      const ctx = dateCtx();
+      const list = state.medicines.filter((m) => matchesQuery(m, q) && matchesFilter(m, f, ctx));
+      const shown = list.slice(0, RENDER_CAP);
+      if (!list.length) { body.replaceChildren(h('p', { class: 'note' }, 'No medicines match. Try a different search or filter.')); return; }
+      body.replaceChildren(
+        simpleTable(['Medicine', 'Category', 'Price', 'Stock', 'Expiry', 'Status', isAdmin ? 'Actions' : null].filter(Boolean),
+          shown.map((m) => h('tr', null,
+            h('td', null, h('strong', null, m.name), m.barcode ? h('div', { class: 'muted' }, m.barcode) : null),
+            h('td', null, m.category),
+            h('td', { class: 'num' }, money(m.price)),
+            h('td', { class: 'num' }, m.stock),
+            h('td', null, expiryText(m, ctx.today)),
+            h('td', null, statusBadge(statusOf(m, ctx)) || h('span', { class: 'muted' }, 'OK')),
+            isAdmin ? h('td', { class: 'row-actions' },
+              h('button', { class: 'btn small', type: 'button', onclick: () => restockForm(m) }, 'Restock'),
+              h('button', { class: 'btn small', type: 'button', onclick: () => medicineForm(m) }, 'Edit')) : null))),
+        list.length > shown.length ? h('p', { class: 'note' }, `Showing ${shown.length} of ${list.length}. Search to narrow it down.`) : null);
+    };
+    redraw();
+    return h('div', null,
+      h('div', { class: 'toolbar' }, search, filter,
+        isAdmin ? h('button', { class: 'btn primary', type: 'button', onclick: () => medicineForm(null) }, 'Add medicine') : null),
+      body);
+  }
+
+  // ---------------------------------------------------------------- sales history
+  const readSale = (s) => ({
+    id: s.saleId ?? s.id,
+    total: s.total,
+    at: s.createdAt ?? s.created_at,
+    by: s.cashier ?? s.username ?? '',
+    voided: Boolean(s.voided) || s.status === 'voided',
   });
 
-  // ---------------------------------------------------------------- POS
-  function pruneCart() {
-    const notes = [];
-    for (const [id, qty] of [...cart]) {
-      const m = medById(id);
-      if (!m || !isSellable(m)) {
-        cart.delete(id);
-        notes.push(`${m ? m.name : 'An item'} was removed (no longer available)`);
-      } else if (qty > m.stock) {
-        cart.set(id, m.stock);
-        notes.push(`${m.name} reduced to ${m.stock} (available stock)`);
-      }
-    }
-    if (notes.length) {
-      checkoutKey = null;
-      toast(notes.length === 1 ? `${notes[0]}.` : `Cart updated: ${notes.join('; ')}.`, 'error');
-    }
+  function voidForm(sale, reload) {
+    openForm({
+      title: `Void sale #${sale.id}`,
+      intro: 'The items go back into stock and the sale is marked as voided. This can\'t be undone.',
+      submitLabel: 'Void sale',
+      danger: true,
+      fields: [{ name: 'reason', label: 'Reason', minlength: 3, maxlength: 200, help: 'For the audit log, e.g. "Customer returned".' }],
+      onSubmit: async (v) => {
+        const reason = v.reason.trim();
+        if (reason.length < 3) throw new Error('Enter a reason (3+ characters).');
+        await api(`/sales/${sale.id}/void`, { method: 'POST', body: { reason } });
+        toast(`Sale #${sale.id} voided.`, 'success');
+        await refreshMedicines().catch(() => {});
+        reload();
+      },
+    });
   }
 
-  function addToCart(id) {
-    const m = medById(id);
-    if (!m || !isSellable(m)) return;
-    const q = cart.get(id) || 0;
-    if (q >= m.stock) return toast(`No more stock available for ${m.name}.`, 'error');
-    cart.set(id, Math.min(q + 1, MAX_LINE_QTY));
-    checkoutKey = null;
-    repaint();
-  }
-  function setQty(id, q) {
-    const m = medById(id);
-    if (!m || q <= 0) cart.delete(id); else cart.set(id, Math.min(q, m.stock, MAX_LINE_QTY));
-    checkoutKey = null;
-    repaint();
-  }
-
-  function cartTotals() {
-    let sub = 0;
-    for (const [id, qty] of cart) { const m = medById(id); if (m) sub += cents(m.price) * qty; }
-    const tax = Math.round(sub * state.cfg.taxRate);
-    return { sub, tax, total: sub + tax };
+  function viewSales() {
+    return loadedView(
+      async () => { const d = await api('/sales'); return (Array.isArray(d) ? d : d.sales || []).map(readSale); },
+      (sales, reload) => {
+        if (!sales.length) return h('p', { class: 'note' }, 'No sales yet. They will show up here after the first checkout.');
+        return simpleTable(['Sale', 'When', 'Cashier', 'Total', 'Status', ''],
+          sales.slice(0, RENDER_CAP).map((s) => h('tr', null,
+            h('td', null, `#${s.id}`),
+            h('td', null, formatDateTime(s.at)),
+            h('td', null, s.by),
+            h('td', { class: 'num' }, money(s.total)),
+            h('td', null, s.voided ? h('span', { class: 'badge bad' }, 'Voided') : h('span', { class: 'badge ok' }, 'Paid')),
+            h('td', { class: 'row-actions' },
+              h('button', { class: 'btn small', type: 'button', onclick: () => downloadReceipt(s.id) }, 'Receipt'),
+              s.voided ? null : h('button', { class: 'btn small', type: 'button', onclick: () => voidForm(s, reload) }, 'Void')))));
+      });
   }
 
-  // The server recalculates price and tax; the cart only sends ids and quantities.
-  async function checkout() {
-    if (!cart.size || state.checkingOut) return;
-    state.checkingOut = true;
-    repaint();
-    checkoutKey = checkoutKey || randomKey(); // a retry of the same cart reuses the key, so it can't double-charge
+  // ---------------------------------------------------------------- staff (admin)
+  function addUserForm(reload) {
+    openForm({
+      title: 'Add pharmacist',
+      submitLabel: 'Create account',
+      fields: [
+        { name: 'username', label: 'Username', maxlength: 30, autocapitalize: 'none', help: 'Not case-sensitive.' },
+        { name: 'password', label: 'Temporary password', type: 'password', autocomplete: 'new-password', minlength: 8, maxlength: 72, help: 'At least 8 characters. They can change it after signing in.' },
+      ],
+      onSubmit: async (v) => {
+        await api('/users', { method: 'POST', body: { username: v.username.trim(), password: v.password } });
+        toast(`${v.username.trim()} can now sign in.`, 'success');
+        reload();
+      },
+    });
+  }
+
+  function deleteUserForm(u, reload) {
+    openForm({
+      title: `Remove ${u.username}?`,
+      intro: 'They will no longer be able to sign in. Their past sales stay in the history.',
+      submitLabel: 'Remove account',
+      danger: true,
+      onSubmit: async () => {
+        await api(`/users/${u.id}`, { method: 'DELETE' });
+        toast(`${u.username} removed.`, 'success');
+        reload();
+      },
+    });
+  }
+
+  function viewUsers() {
+    return loadedView(() => api('/users'), (users, reload) => h('div', null,
+      h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', type: 'button', onclick: () => addUserForm(reload) }, 'Add pharmacist')),
+      simpleTable(['Username', 'Role', ''], users.map((u) => h('tr', null,
+        h('td', null, u.username),
+        h('td', null, u.role),
+        h('td', { class: 'row-actions' },
+          u.username === state.user.username ? h('span', { class: 'muted' }, 'You') :
+            h('button', { class: 'btn small danger', type: 'button', onclick: () => deleteUserForm(u, reload) }, 'Remove')))))));
+  }
+
+  // ---------------------------------------------------------------- boot
+  (async function boot() {
+    const saved = store.get(TOKEN_KEY);
+    if (!saved) return renderLogin();
+    state.token = saved;
     try {
-      const sale = await api('/sales', {
-        method: 'POST',
-        headers: { 'Idempotency-Key': checkoutKey },
-        body: { items: [...cart].map(([medicineId, quantity]) => ({ medicineId
+      await loadSession();
+      renderShell();
+      bumpIdle();
+    } catch (e) {
+      // A 401 already ran logout() and showed the sign-in screen
+      if (state.token) { state.token = null; store.del(TOKEN_KEY); renderLogin(formatErr(e)); }
+    }
+  })();
+})();
