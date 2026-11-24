@@ -1,4 +1,4 @@
-name: Deploy Pharmadawa
+name: Deploy PharmaDawa
 
 on:
   push:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/pharmadawa
+  IMAGE: ghcr.io/${{ github.repository_owner }}/pharmaDawa
 
 jobs:
   test:
@@ -66,21 +66,21 @@ jobs:
           script_stop: true
           script: |
             echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
-            mkdir -p ~/pharmadawa
-            printf '%s\n' "$APP_ENV_FILE" > ~/pharmadawa/.env
+            mkdir -p ~/pharmaDawa
+            printf '%s\n' "$APP_ENV_FILE" > ~/pharmaDawa/.env
 
             docker pull "$IMAGE:latest"
-            docker rm -f pharmadawa 2>/dev/null || true
-            docker run -d --name pharmadawa --restart unless-stopped \
+            docker rm -f pharmaDawa 2>/dev/null || true
+            docker run -d --name pharmaDawa --restart unless-stopped \
               --env-file ~/pharmadawa/.env \
-              -v pharmadawa-data:/app/data \
+              -v pharmaDawa-data:/app/data \
               -p 80:3000 "$IMAGE:latest"
 
             # Wait up to 30s for the container to report healthy
             for i in $(seq 1 15); do
-              s=$(docker inspect -f '{{.State.Health.Status}}' pharmadawa)
+              s=$(docker inspect -f '{{.State.Health.Status}}' pharmaDawa)
               [ "$s" = "healthy" ] && echo "Deployed OK" && docker image prune -f && exit 0
               sleep 2
             done
-            docker logs --tail 50 pharmadawa
+            docker logs --tail 50 pharmaDawa
             echo "Deploy failed health check" && exit 1
