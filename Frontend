@@ -12,6 +12,7 @@ const scrypt = promisify(crypto.scrypt);
 const env = process.env;
 
 // ---------------------------------------------------------------- config
+
 const CFG = {
   port: Number(env.PORT) || 3000,
   host: env.HOST || '127.0.0.1',
@@ -26,10 +27,11 @@ const CFG = {
   trustProxy: env.TRUST_PROXY === 'true',
   seedDemo: env.SEED_DEMO !== undefined ? env.SEED_DEMO === 'true' : env.NODE_ENV !== 'production',
 };
+
 const MAX_LINE_QTY = 1000;
 const MAX_STOCK = 1_000_000;
 
-function fatal(msg) { console.error(`Config error: ${msg}`); process.exit(1); }
+function fatal(msg) { console.error (`Config error: ${msg}`); process.exit(1); }
 if (CFG.jwtSecret.length < 32) fatal('JWT_SECRET must be a random string of at least 32 characters (run: openssl rand -hex 32).');
 if (!Number.isFinite(CFG.taxRate) || CFG.taxRate < 0 || CFG.taxRate > 1) fatal('TAX_RATE must be between 0 and 1 (0.05 = 5%).');
 
